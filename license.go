@@ -15,10 +15,8 @@ import (
 )
 
 // DepVersion holds two version strings:
-// - Display: Shown in the report’s Version column.
-//            If no literal version is declared, this is set to "version not found in build.gradle file".
-// - Lookup:  Used for constructing POM URLs and retrieving license info.
-//            (If missing, dynamic lookup is attempted.)
+// - Display: Shown in the report’s Version column. If no literal version is declared, this is set to "version not found in build.gradle file".
+// - Lookup:  Used for constructing POM URLs and retrieving license info. (If missing, dynamic lookup is attempted.)
 type DepVersion struct {
 	Display string
 	Lookup  string
@@ -88,7 +86,8 @@ func parseBuildGradleFile(filePath string) (map[string]DepVersion, error) {
 	re := regexp.MustCompile(`(?m)^\s*(implementation|api|compileOnly|runtimeOnly|testImplementation|androidTestImplementation|classpath)\s+['"]([^'"]+)['"]`)
 	matches := re.FindAllStringSubmatch(content, -1)
 	for _, match := range matches {
-		// match[2] is the dependency string, e.g.:
+		// match[2] is the dependency string.
+		// Examples:
 		//   "androidx.appcompat:appcompat:1.4.2"
 		//   "com.onesignal:OneSignal:[4.0.0, 4.99.99]"
 		//   "androidx.camera:camera-core:${cameraxVersion}"
@@ -99,7 +98,7 @@ func parseBuildGradleFile(filePath string) (map[string]DepVersion, error) {
 			group = parts[0]
 			artifact = parts[1]
 			version = parts[2]
-			// Handle version range: if version starts with "[" then pick the first version.
+			// Handle version range: if version starts with "[" then take the first version.
 			if strings.HasPrefix(version, "[") {
 				trimmed := strings.Trim(version, "[]")
 				tokens := strings.Split(trimmed, ",")
@@ -138,7 +137,6 @@ func parseBuildGradleFile(filePath string) (map[string]DepVersion, error) {
 				Lookup:  version,
 			}
 		}
-		// Keep the first occurrence if duplicate.
 		if _, exists := dependencies[key]; !exists {
 			dependencies[key] = depVer
 		}
@@ -278,7 +276,7 @@ func scrapeLicense(projectURL string) string {
 	return ""
 }
 
-// fetchPOMFromURL fetches and unmarshals the POM from the given URL using an XML decoder with strict mode disabled.
+// fetchPOMFromURL fetches and unmarshals the POM from the given URL using an XML decoder with Strict mode disabled.
 func fetchPOMFromURL(url string) (*MavenPOM, error) {
 	resp, err := http.Get(url)
 	if err != nil {
@@ -354,12 +352,9 @@ func fetchPOM(groupID, artifactID, version string) (string, string, *MavenPOM, e
 	return finalSourceURL, finalProjectURL, finalPOM, nil
 }
 
-// getLicenseInfo fetches the license details for a dependency.
-// If the POM does not contain license info, it attempts to scrape the license from the project URL.
 func getLicenseInfo(groupID, artifactID, version string) (string, string, string) {
 	sourceURL, projectURL, pom, err := fetchPOM(groupID, artifactID, version)
 	if err != nil || pom == nil || len(pom.Licenses) == 0 {
-		// Attempt to scrape license info from the project page.
 		licenseScraped := scrapeLicense(projectURL)
 		if licenseScraped != "" {
 			return licenseScraped, projectURL, sourceURL
@@ -367,39 +362,6 @@ func getLicenseInfo(groupID, artifactID, version string) (string, string, string
 		return "Unknown", fmt.Sprintf("https://www.google.com/search?q=%s+%s+%s+license", groupID, artifactID, version), ""
 	}
 	return pom.Licenses[0].Name, projectURL, sourceURL
-}
-
-// scrapeLicense attempts to scrape a license name from the given project URL's HTML content.
-func scrapeLicense(projectURL string) string {
-	resp, err := http.Get(projectURL)
-	if err != nil {
-		return ""
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return ""
-	}
-	htmlBytes, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		return ""
-	}
-	html := string(htmlBytes)
-	// A simple list of common license keywords.
-	licenseKeywords := []string{
-		"Apache License", "Apache-2.0",
-		"MIT License", "MIT",
-		"BSD License", "BSD",
-		"GNU General Public License", "GPL",
-		"GNU Lesser General Public License", "LGPL",
-		"Mozilla Public License", "MPL",
-		"Eclipse Public License", "EPL",
-	}
-	for _, lic := range licenseKeywords {
-		if strings.Contains(html, lic) {
-			return lic
-		}
-	}
-	return ""
 }
 
 func splitDependency(dep string) (string, string, error) {
