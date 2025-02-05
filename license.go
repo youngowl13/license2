@@ -16,7 +16,7 @@ import (
 
 // DepVersion holds two version strings:
 // - Display: What is shown in the report’s Version column.
-//            If no version is declared in the build.gradle file,
+//            If no literal version is declared in the build.gradle file,
 //            this is set to "version not found in build.gradle file".
 // - Lookup:  The version used for constructing POM URLs and retrieving license info.
 //            (If missing, dynamic lookup is attempted.)
@@ -43,6 +43,18 @@ type GradleReportSection struct {
 	Dependencies map[string]DepVersion
 }
 
+// parseVariables scans the file content for variable definitions.
+// For example, a line like: def cameraxVersion = "1.1.0-alpha05"
+func parseVariables(content string) map[string]string {
+	varMap := make(map[string]string)
+	re := regexp.MustCompile(`(?m)^\s*def\s+(\w+)\s*=\s*["']([^"']+)["']`)
+	matches := re.FindAllStringSubmatch(content, -1)
+	for _, match := range matches {
+		varMap[match[1]] = match[2]
+	}
+	return varMap
+}
+
 // findBuildGradleFiles recursively finds all files named "build.gradle" (case-insensitive) starting from root.
 func findBuildGradleFiles(root string) ([]string, error) {
 	var files []string
@@ -61,19 +73,25 @@ func findBuildGradleFiles(root string) ([]string, error) {
 	return files, nil
 }
 
-// parseBuildGradleFile parses a single build.gradle file to extract dependency declarations.
-// It expects lines such as: implementation 'group:artifact:version'
+// parseBuildGradleFile parses a single build.gradle file to extract dependency declarations
+// and perform variable substitution for versions.
 func parseBuildGradleFile(filePath string) (map[string]DepVersion, error) {
 	dependencies := make(map[string]DepVersion)
-	// Regular expression to match dependency declarations for common configurations.
-	re := regexp.MustCompile(`(?m)^\s*(implementation|api|compileOnly|runtimeOnly|testImplementation|androidTestImplementation)\s+['"]([^'"]+)['"]`)
-	data, err := ioutil.ReadFile(filePath)
+	contentBytes, err := ioutil.ReadFile(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("cannot read file %s: %v", filePath, err)
 	}
-	matches := re.FindAllStringSubmatch(string(data), -1)
+	content := string(contentBytes)
+
+	// First, parse variable definitions.
+	varMap := parseVariables(content)
+
+	// Regular expression to match dependency declarations for common configurations.
+	re := regexp.MustCompile(`(?m)^\s*(implementation|api|compileOnly|runtimeOnly|testImplementation|androidTestImplementation)\s+['"]([^'"]+)['"]`)
+	matches := re.FindAllStringSubmatch(content, -1)
 	for _, match := range matches {
-		// match[2] is the dependency string, e.g. "androidx.appcompat:appcompat:1.4.2"
+		// match[2] is the dependency string, e.g. "androidx.appcompat:appcompat:1.4.2" 
+		// or "com.onesignal:OneSignal:[4.0.0, 4.99.99]" or "androidx.camera:camera-core:${cameraxVersion}"
 		depStr := match[2]
 		parts := strings.Split(depStr, ":")
 		var group, artifact, version string
@@ -81,6 +99,25 @@ func parseBuildGradleFile(filePath string) (map[string]DepVersion, error) {
 			group = parts[0]
 			artifact = parts[1]
 			version = parts[2]
+			// Handle version range: if version starts with "[" then pick the first version inside the brackets.
+			if strings.HasPrefix(version, "[") {
+				trimmed := strings.Trim(version, "[]")
+				tokens := strings.Split(trimmed, ",")
+				if len(tokens) > 0 {
+					version = strings.TrimSpace(tokens[0])
+				}
+			}
+			// If version contains variable interpolation, substitute it.
+			if strings.Contains(version, "${") {
+				reVar := regexp.MustCompile(`\$\{([^}]+)\}`)
+				version = reVar.ReplaceAllStringFunc(version, func(s string) string {
+					inner := s[2 : len(s)-1]
+					if val, ok := varMap[inner]; ok {
+						return val
+					}
+					return ""
+				})
+			}
 		} else {
 			if len(parts) >= 2 {
 				group = parts[0]
@@ -101,7 +138,6 @@ func parseBuildGradleFile(filePath string) (map[string]DepVersion, error) {
 				Lookup:  version,
 			}
 		}
-		// Keep the first occurrence if duplicate.
 		if _, exists := dependencies[key]; !exists {
 			dependencies[key] = depVer
 		}
@@ -118,7 +154,7 @@ func parseAllBuildGradleFiles(filePaths []string) ([]GradleReportSection, error)
 			fmt.Printf("Error parsing file %s: %v\n", f, err)
 			continue
 		}
-		// For dependencies with missing version, attempt dynamic lookup.
+		// For dependencies with missing Lookup version, attempt dynamic lookup.
 		for key, dep := range deps {
 			if dep.Lookup == "unknown" {
 				parts := strings.Split(key, "/")
@@ -235,8 +271,8 @@ func fetchPOM(groupID, artifactID, version string) (string, string, *MavenPOM, e
 	googlePOMURL := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, artifactID, version, artifactID, version)
 	type result struct {
 		pom        *MavenPOM
-		sourceURL  string // URL used to fetch the POM file.
-		projectURL string // URL used for the "View Details" link.
+		sourceURL  string
+		projectURL string
 		err        error
 	}
 	resultCh := make(chan result, 2)
@@ -333,12 +369,14 @@ func isCopyleft(licenseName string) bool {
 	return false
 }
 
-// generateHTMLReport creates an HTML report with separate sections for each build.gradle file.
-// The report file "dependency-license-report.html" will be generated in the current directory.
 func generateHTMLReport(sections []GradleReportSection) error {
-	// Set output directory as current directory.
-	outputDir := "."
-	reportPath := filepath.Join(outputDir, "dependency-license-report.html")
+	// Generate the report in the folder "license-checker" in the current working directory.
+	outputDir := "./license-checker"
+	if _, err := os.Stat(outputDir); os.IsNotExist(err) {
+		if err := os.Mkdir(outputDir, 0755); err != nil {
+			return fmt.Errorf("error creating output directory: %v", err)
+		}
+	}
 	const tmplText = `<!DOCTYPE html>
 <html>
 <head>
@@ -406,6 +444,7 @@ func generateHTMLReport(sections []GradleReportSection) error {
 	if err != nil {
 		return fmt.Errorf("error creating template: %v", err)
 	}
+	reportPath := filepath.Join(outputDir, "dependency-license-report.html")
 	file, err := os.Create(reportPath)
 	if err != nil {
 		return fmt.Errorf("error creating report file: %v", err)
