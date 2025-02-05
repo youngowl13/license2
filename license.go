@@ -15,10 +15,9 @@ import (
 )
 
 // DepVersion holds two version strings:
-// - Display: What is shown in the report’s Version column.
-//            If no literal version is declared in the build.gradle file,
+// - Display: Shown in the report’s Version column. If no literal version is declared,
 //            this is set to "version not found in build.gradle file".
-// - Lookup:  The version used for constructing POM URLs and retrieving license info.
+// - Lookup:  Used for constructing POM URLs and retrieving license info.
 //            (If missing, dynamic lookup is attempted.)
 type DepVersion struct {
 	Display string
@@ -37,13 +36,13 @@ type MavenPOM struct {
 	Licenses []License `xml:"licenses>license"`
 }
 
-// GradleReportSection holds the file path of a build.gradle file and its extracted dependencies.
+// GradleReportSection holds the file path of one build.gradle file and its extracted dependencies.
 type GradleReportSection struct {
 	FilePath     string
 	Dependencies map[string]DepVersion
 }
 
-// parseVariables scans the file content for variable definitions (e.g. def cameraxVersion = "1.1.0-alpha05")
+// parseVariables scans the file content for variable definitions (e.g. def cameraxVersion = "1.1.0-alpha05").
 func parseVariables(content string) map[string]string {
 	varMap := make(map[string]string)
 	re := regexp.MustCompile(`(?m)^\s*def\s+(\w+)\s*=\s*["']([^"']+)["']`)
@@ -81,15 +80,18 @@ func parseBuildGradleFile(filePath string) (map[string]DepVersion, error) {
 		return nil, fmt.Errorf("cannot read file %s: %v", filePath, err)
 	}
 	content := string(contentBytes)
+
 	// Parse variable definitions.
 	varMap := parseVariables(content)
+
 	// Regular expression to match dependency declarations for common configurations,
 	// including "classpath".
 	re := regexp.MustCompile(`(?m)^\s*(implementation|api|compileOnly|runtimeOnly|testImplementation|androidTestImplementation|classpath)\s+['"]([^'"]+)['"]`)
 	matches := re.FindAllStringSubmatch(content, -1)
 	for _, match := range matches {
-		// match[2] is the dependency string, e.g. "androidx.appcompat:appcompat:1.4.2",
-		// "com.onesignal:OneSignal:[4.0.0, 4.99.99]", or "androidx.camera:camera-core:${cameraxVersion}".
+		// match[2] is the dependency string, e.g.:
+		// "androidx.appcompat:appcompat:1.4.2", "com.onesignal:OneSignal:[4.0.0, 4.99.99]",
+		// or "androidx.camera:camera-core:${cameraxVersion}"
 		depStr := match[2]
 		parts := strings.Split(depStr, ":")
 		var group, artifact, version string
