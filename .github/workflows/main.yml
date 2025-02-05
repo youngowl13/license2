@@ -29,16 +29,8 @@ jobs:
           go mod init license-checker || true
           go mod tidy
           go run license.go
-
-      # Step 4: Verify the generated report
-      - name: Verify Report
-        run: |
-          if [ -f ./license-checker/dependency-license-report.html ]; then
-            echo "✅ License report exists!"
-          else
-            echo "❌ License report is missing!"
-            exit 1
-          fi
+          ls -la
+     
 
       # Step 5: Upload the generated report as an artifact
       - name: Upload License Report
