@@ -43,8 +43,7 @@ type GradleReportSection struct {
 	Dependencies map[string]DepVersion
 }
 
-// parseVariables scans the file content for variable definitions.
-// For example, a line like: def cameraxVersion = "1.1.0-alpha05"
+// parseVariables scans the file content for variable definitions (e.g. def cameraxVersion = "1.1.0-alpha05")
 func parseVariables(content string) map[string]string {
 	varMap := make(map[string]string)
 	re := regexp.MustCompile(`(?m)^\s*def\s+(\w+)\s*=\s*["']([^"']+)["']`)
@@ -74,7 +73,7 @@ func findBuildGradleFiles(root string) ([]string, error) {
 }
 
 // parseBuildGradleFile parses a single build.gradle file to extract dependency declarations
-// and perform variable substitution for versions.
+// and performs variable substitution for version numbers.
 func parseBuildGradleFile(filePath string) (map[string]DepVersion, error) {
 	dependencies := make(map[string]DepVersion)
 	contentBytes, err := ioutil.ReadFile(filePath)
@@ -83,14 +82,15 @@ func parseBuildGradleFile(filePath string) (map[string]DepVersion, error) {
 	}
 	content := string(contentBytes)
 
-	// First, parse variable definitions.
+	// Parse variable definitions.
 	varMap := parseVariables(content)
 
-	// Regular expression to match dependency declarations for common configurations.
-	re := regexp.MustCompile(`(?m)^\s*(implementation|api|compileOnly|runtimeOnly|testImplementation|androidTestImplementation)\s+['"]([^'"]+)['"]`)
+	// Regular expression to match dependency declarations.
+	// Note: Added "classpath" along with other common dependency keywords.
+	re := regexp.MustCompile(`(?m)^\s*(implementation|api|compileOnly|runtimeOnly|testImplementation|androidTestImplementation|classpath)\s+['"]([^'"]+)['"]`)
 	matches := re.FindAllStringSubmatch(content, -1)
 	for _, match := range matches {
-		// match[2] is the dependency string, e.g. "androidx.appcompat:appcompat:1.4.2" 
+		// match[2] is the dependency string, e.g., "androidx.appcompat:appcompat:1.4.2" 
 		// or "com.onesignal:OneSignal:[4.0.0, 4.99.99]" or "androidx.camera:camera-core:${cameraxVersion}"
 		depStr := match[2]
 		parts := strings.Split(depStr, ":")
@@ -99,7 +99,7 @@ func parseBuildGradleFile(filePath string) (map[string]DepVersion, error) {
 			group = parts[0]
 			artifact = parts[1]
 			version = parts[2]
-			// Handle version range: if version starts with "[" then pick the first version inside the brackets.
+			// Handle version range: if version starts with "[" then pick the first version.
 			if strings.HasPrefix(version, "[") {
 				trimmed := strings.Trim(version, "[]")
 				tokens := strings.Split(trimmed, ",")
@@ -107,7 +107,7 @@ func parseBuildGradleFile(filePath string) (map[string]DepVersion, error) {
 					version = strings.TrimSpace(tokens[0])
 				}
 			}
-			// If version contains variable interpolation, substitute it.
+			// Substitute variable interpolation if version contains "${"
 			if strings.Contains(version, "${") {
 				reVar := regexp.MustCompile(`\$\{([^}]+)\}`)
 				version = reVar.ReplaceAllStringFunc(version, func(s string) string {
@@ -271,8 +271,8 @@ func fetchPOM(groupID, artifactID, version string) (string, string, *MavenPOM, e
 	googlePOMURL := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, artifactID, version, artifactID, version)
 	type result struct {
 		pom        *MavenPOM
-		sourceURL  string
-		projectURL string
+		sourceURL  string // URL used to fetch the POM file.
+		projectURL string // URL used for the "View Details" link.
 		err        error
 	}
 	resultCh := make(chan result, 2)
