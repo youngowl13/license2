@@ -37,7 +37,7 @@ type MavenPOM struct {
 	Licenses []License `xml:"licenses>license"`
 }
 
-// GradleReportSection holds the file path of one build.gradle file and its extracted dependencies.
+// GradleReportSection holds the file path of a build.gradle file and its extracted dependencies.
 type GradleReportSection struct {
 	FilePath     string
 	Dependencies map[string]DepVersion
@@ -81,17 +81,15 @@ func parseBuildGradleFile(filePath string) (map[string]DepVersion, error) {
 		return nil, fmt.Errorf("cannot read file %s: %v", filePath, err)
 	}
 	content := string(contentBytes)
-
 	// Parse variable definitions.
 	varMap := parseVariables(content)
-
-	// Regular expression to match dependency declarations.
-	// Note: Added "classpath" along with other common dependency keywords.
+	// Regular expression to match dependency declarations for common configurations,
+	// including "classpath".
 	re := regexp.MustCompile(`(?m)^\s*(implementation|api|compileOnly|runtimeOnly|testImplementation|androidTestImplementation|classpath)\s+['"]([^'"]+)['"]`)
 	matches := re.FindAllStringSubmatch(content, -1)
 	for _, match := range matches {
-		// match[2] is the dependency string, e.g., "androidx.appcompat:appcompat:1.4.2" 
-		// or "com.onesignal:OneSignal:[4.0.0, 4.99.99]" or "androidx.camera:camera-core:${cameraxVersion}"
+		// match[2] is the dependency string, e.g. "androidx.appcompat:appcompat:1.4.2",
+		// "com.onesignal:OneSignal:[4.0.0, 4.99.99]", or "androidx.camera:camera-core:${cameraxVersion}".
 		depStr := match[2]
 		parts := strings.Split(depStr, ":")
 		var group, artifact, version string
@@ -107,7 +105,7 @@ func parseBuildGradleFile(filePath string) (map[string]DepVersion, error) {
 					version = strings.TrimSpace(tokens[0])
 				}
 			}
-			// Substitute variable interpolation if version contains "${"
+			// Substitute variable interpolation if version contains "${".
 			if strings.Contains(version, "${") {
 				reVar := regexp.MustCompile(`\$\{([^}]+)\}`)
 				version = reVar.ReplaceAllStringFunc(version, func(s string) string {
@@ -138,6 +136,7 @@ func parseBuildGradleFile(filePath string) (map[string]DepVersion, error) {
 				Lookup:  version,
 			}
 		}
+		// Keep the first occurrence if duplicate.
 		if _, exists := dependencies[key]; !exists {
 			dependencies[key] = depVer
 		}
@@ -258,8 +257,10 @@ func fetchPOMFromURL(url string) (*MavenPOM, error) {
 		return nil, fmt.Errorf("error reading POM from %s: %v", url, err)
 	}
 	var pom MavenPOM
-	err = xml.Unmarshal(data, &pom)
-	if err != nil {
+	// Use a decoder with Strict mode disabled to ignore namespace issues.
+	decoder := xml.NewDecoder(bytes.NewReader(data))
+	decoder.Strict = false
+	if err := decoder.Decode(&pom); err != nil {
 		return nil, fmt.Errorf("error unmarshalling POM from %s: %v", url, err)
 	}
 	return &pom, nil
