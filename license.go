@@ -401,7 +401,7 @@ func generateHTMLReport(sections []GradleReportSection) error {
     </style>
 </head>
 <body>
-    <h1>Build.gradle Dependency License Report</h1>
+    <h1>Kotlin Dependency License Report</h1>
     {{range .}}
         <h2>File: {{.FilePath}}</h2>
         {{if .Dependencies}}
