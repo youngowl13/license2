@@ -384,7 +384,7 @@ func generateHTMLReport(sections []GradleReportSection) error {
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>Build.gradle Dependency License Report</title>
+    <title>Kotlin Dependency License Report</title>
     <style>
         body { font-family: Arial, sans-serif; margin: 20px; }
         h1 { color: #2c3e50; }
