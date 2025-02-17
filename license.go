@@ -17,91 +17,39 @@ import (
 )
 
 // -------------------------------------------------------------------------------------
-// Data Structures
+// DATA STRUCTURES
 // -------------------------------------------------------------------------------------
 
-// DepVersion holds two version strings:
-// - Display: shown in the report's Version column
-// - Lookup:  used for POM/License fetching
-type DepVersion struct {
+// GradleDependencyNode represents one node in the dependency tree.
+// This is where we store the hierarchy (Transitive children) plus license info, etc.
+type GradleDependencyNode struct {
+	Name       string                   // e.g. "androidx.appcompat:appcompat" or just "appcompat"
+	Version    string                   // e.g. "1.4.2"
+	License    string                   // e.g. "Apache-2.0" or "MIT" or "Unknown"
+	Details    string                   // e.g. a link to project details
+	PomURL     string                   // e.g. a link to the .pom file
+	Copyleft   bool                     // true if the license is recognized as copyleft
+	Parent     string                   // "direct" if top-level, or "group:artifact:version" if transitive
+	Language   string                   // For labeling "Kotlin/Gradle" or similar if needed
+	Transitive []*GradleDependencyNode  // children
+}
+
+// For tabular display we also keep the older concept of ExtendedDepInfo:
+type ExtendedDepInfo struct {
 	Display string
 	Lookup  string
+	Parent  string // "direct" or "group:artifact:version"
 }
 
-// GradleDependencyNode represents a node in the dependency tree
-type GradleDependencyNode struct {
-	Name        string            // e.g., "androidx.appcompat/appcompat"
-	Version     string            // e.g., "1.4.2"
-	License     string            // License name
-	Details     string            // Project URL
-	PomURL      string            // POM URL
-	Copyleft    bool              // Is it a copyleft license?
-	Parent      string            // Parent dependency (for table, "direct" or "group:artifact:version")
-	Transitive  []*GradleDependencyNode // Child dependencies
-	Language    string            // "gradle"
-	FlatDepsKey string            // Key for FlatDep linking if needed (can add later if table kept)
+// GradleReportSection holds data for one build.gradle file
+type GradleReportSection struct {
+	FilePath       string                                   // path of the build.gradle
+	Dependencies   map[string]ExtendedDepInfo               // the old "flat" map of dependencies
+	DependencyTree []*GradleDependencyNode                  // new tree-based structure for the same dependencies
+	TransitiveCount int                                      // how many are transitive (for stats)
 }
 
-
-// ExtendedDepInfo holds the dependency + its immediate parent (for the final HTML report).
-// - Parent = "direct" if declared in build.gradle
-// - Parent = "group:artifact:version" if discovered transitively
-type ExtendedDepInfo struct { // Keeping this for the table output for now
-	DepVersion
-	Parent string
-}
-
-// License represents the license details from a POM file.
-type License struct {
-	Name string `xml:"name"`
-	URL  string `xml:"url"`
-}
-
-// MavenPOM represents the structure of a Maven POM file. We parse just the essential parts.
-type MavenPOM struct {
-	XMLName        xml.Name      `xml:"project"`
-	Parent         POMParent     `xml:"parent"`
-	DependencyMgmt POMDepMgmt    `xml:"dependencyManagement"`
-	Dependencies   []POMDep      `xml:"dependencies>dependency"`
-	Licenses       []License     `xml:"licenses>license"`
-	GroupID        string        `xml:"groupId"`
-	ArtifactID     string        `xml:"artifactId"`
-	Version        string        `xml:"version"`
-}
-
-// POMParent holds <parent> info if present (for inheritance).
-type POMParent struct {
-	GroupID    string `xml:"groupId"`
-	ArtifactID string `xml:"artifactId"`
-	Version    string `xml:"version"`
-}
-
-// POMDepMgmt holds a <dependencyManagement> section, which can have its own <dependencies>.
-type POMDepMgmt struct {
-	Dependencies []POMDep `xml:"dependencies>dependency"`
-}
-
-// POMDep is a minimal struct for each <dependency> in <dependencies> or <dependencyManagement>.
-type POMDep struct {
-	GroupID    string `xml:"groupId"`
-	ArtifactID string `xml:"artifactId"`
-	Version    string `xml:"version"`
-	Scope      string `xml:"scope"`
-	Optional   string `xml:"optional"`
-}
-
-// GradleReportSection holds data for one build.gradle file:
-// - FilePath for reference
-// - Dependencies map: key="group/artifact", value=ExtendedDepInfo
-// - TransitiveCount for display
-type GradleReportSection struct { // Keeping this for table output for now
-	FilePath        string
-	Dependencies    map[string]ExtendedDepInfo
-	TransitiveCount int
-	DependencyTree  []*GradleDependencyNode // New field to hold the dependency tree
-}
-
-// We define a struct to carry final license info for template usage.
+// LicenseData is used to return a single object from template funcs
 type LicenseData struct {
 	LicenseName string
 	ProjectURL  string
@@ -109,13 +57,12 @@ type LicenseData struct {
 }
 
 // -------------------------------------------------------------------------------------
-// Step 1: Find and Parse Direct Dependencies from build.gradle
+// STEP 1: FIND AND PARSE DIRECT DEPENDENCIES IN build.gradle FILES
 // -------------------------------------------------------------------------------------
 
-// findBuildGradleFiles finds all "build.gradle" files (case-insensitive) under root.
 func findBuildGradleFiles(root string) ([]string, error) {
 	var files []string
-	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
 		if err != nil {
 			return err
 		}
@@ -124,53 +71,50 @@ func findBuildGradleFiles(root string) ([]string, error) {
 		}
 		return nil
 	})
-	if err != nil {
-		return nil, err
-	}
-	return files, nil
+	return files, err
 }
 
-// parseVariables scans for variable definitions like: def cameraVersion = "1.2.3"
+// parseVariables scans lines like `def cameraVersion = "1.2.3"`
 func parseVariables(content string) map[string]string {
-	var varMap make(map[string]string)
+	varMap := make(map[string]string)
 	re := regexp.MustCompile(`(?m)^\s*def\s+(\w+)\s*=\s*["']([^"']+)["']`)
-	matches := re.FindAllStringSubmatch(content, -1)
-	for _, match := range matches {
-		varMap[match[1]] = match[2]
+	all := re.FindAllStringSubmatch(content, -1)
+	for _, m := range all {
+		varMap[m[1]] = m[2]
 	}
 	return varMap
 }
 
-// parseBuildGradleFile extracts direct dependencies from a single build.gradle file and returns them as a slice of GradleDependencyNode.
-func parseBuildGradleFile(filePath string) ([]*GradleDependencyNode, error) {
-	directDependencies := []*GradleDependencyNode{} // Slice to hold root nodes of the tree
-	contentBytes, err := ioutil.ReadFile(filePath)
+// parseBuildGradleFile extracts direct dependencies from a single build.gradle file (flat approach).
+func parseBuildGradleFile(filePath string) (map[string]ExtendedDepInfo, error) {
+	deps := make(map[string]ExtendedDepInfo)
+	data, err := ioutil.ReadFile(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("cannot read file %s: %v", filePath, err)
+		return nil, err
 	}
-	content := string(contentBytes)
+	content := string(data)
 	varMap := parseVariables(content)
 
-	// Regex for e.g. implementation "group:artifact:version"
+	// Regex for lines like: implementation "group:artifact:version"
 	re := regexp.MustCompile(`(?m)^\s*(implementation|api|compileOnly|runtimeOnly|testImplementation|androidTestImplementation|classpath)\s+['"]([^'"]+)['"]`)
-	matches := re.FindAllStringSubmatch(content, -1)
-	for _, match := range matches {
-		depStr := match[2] // e.g. "androidx.appcompat:appcompat:1.4.2"
+	all := re.FindAllStringSubmatch(content, -1)
+	for _, m := range all {
+		depStr := m[2] // e.g. "androidx.appcompat:appcompat:1.4.2"
 		parts := strings.Split(depStr, ":")
 		if len(parts) < 2 {
 			continue
 		}
 		group := parts[0]
 		artifact := parts[1]
-		var version string
+		version := "unknown"
 		if len(parts) >= 3 {
 			version = parts[2]
-			// handle version range [1.0,2.0)
+			// handle version range [x,y)
 			if strings.HasPrefix(version, "[") {
 				trimmed := strings.Trim(version, "[]")
-				tokens := strings.Split(trimmed, ",")
-				if len(tokens) > 0 {
-					version = strings.TrimSpace(tokens[0])
+				toks := strings.Split(trimmed, ",")
+				if len(toks) > 0 {
+					version = strings.TrimSpace(toks[0])
 				}
 			}
 			// handle variable interpolation
@@ -185,201 +129,252 @@ func parseBuildGradleFile(filePath string) ([]*GradleDependencyNode, error) {
 				})
 			}
 		}
-		if version == "" {
-			version = "unknown"
+		key := group + "/" + artifact
+		if _, ok := deps[key]; !ok {
+			deps[key] = ExtendedDepInfo{
+				Display: version,
+				Lookup:  version,
+				Parent:  "direct",
+			}
 		}
-		depName := group + "/" + artifact
-
-		// Create GradleDependencyNode for direct dependency
-		node := &GradleDependencyNode{
-			Name:     depName,
-			Version:  version,
-			Parent:   "direct",
-			Language: "gradle",
-		}
-		directDependencies = append(directDependencies, node)
 	}
-	return directDependencies, nil
+	return deps, nil
 }
 
-
-// parseAllBuildGradleFiles returns a slice of GradleReportSection with direct dependencies.
+// parseAllBuildGradleFiles finds all build.gradle files and gets direct dependencies for each.
 func parseAllBuildGradleFiles(files []string) ([]GradleReportSection, error) {
 	var sections []GradleReportSection
 	for _, f := range files {
-		directDepNodes, err := parseBuildGradleFile(f) // Get []*GradleDependencyNode
+		parsedDeps, err := parseBuildGradleFile(f)
 		if err != nil {
 			fmt.Printf("Error parsing %s: %v\n", f, err)
 			continue
 		}
-
-		depMap := make(map[string]ExtendedDepInfo) // Keep depMap for table for now
-		for _, node := range directDepNodes {
-			depMap[node.Name] = ExtendedDepInfo{
-				DepVersion: DepVersion{
-					Display: node.Version,
-					Lookup:  node.Version,
-				},
-				Parent: "direct",
-			}
-		}
-
 		sections = append(sections, GradleReportSection{
-			FilePath:       f,
-			Dependencies:   depMap, // Still have depMap for table
-			DependencyTree: directDepNodes, // Store the dependency tree here
+			FilePath:     f,
+			Dependencies: parsedDeps,
 		})
 	}
 	return sections, nil
 }
 
 // -------------------------------------------------------------------------------------
-// Step 2: BFS-Based Transitive Dependency Resolution with "Nearest Wins" & Parent POM Support
+// STEP 2: BFS + RECURSIVE POM PARSING -> Build Tree of GradleDependencyNode
 // -------------------------------------------------------------------------------------
 
-// We'll maintain a global lock-free cache for POM retrieval
+// We'll do something akin to "nearest-wins" BFS for each build.gradle's direct dependencies,
+// then build a tree of GradleDependencyNodes, linking children to parents.
+
+// We'll keep a global cache of POMs to avoid refetching
 var pomCache sync.Map // key = "group:artifact:version" => *MavenPOM
 
-// DepState tracks the chosen version & depth for each "group/artifact" we’ve encountered.
-type DepState struct {
-	Version string // final chosen version
-	Depth   int    // BFS depth (1 = direct, 2 = child of direct, etc.)
+// We'll keep a structure for the POM and relevant bits
+type MavenPOM struct {
+	XMLName        xml.Name `xml:"project"`
+	Parent         POMParent
+	DependencyMgmt struct {
+		Dependencies []POMDep `xml:"dependencies>dependency"`
+	} `xml:"dependencyManagement"`
+	Dependencies []POMDep `xml:"dependencies>dependency"`
+	Licenses     []struct {
+		Name string `xml:"name"`
+	} `xml:"licenses>license"`
+
+	GroupID    string `xml:"groupId"`
+	ArtifactID string `xml:"artifactId"`
+	Version    string `xml:"version"`
 }
 
-// We'll store our BFS queue items here
+type POMParent struct {
+	GroupID    string `xml:"groupId"`
+	ArtifactID string `xml:"artifactId"`
+	Version    string `xml:"version"`
+}
+
+type POMDep struct {
+	GroupID    string `xml:"groupId"`
+	ArtifactID string `xml:"artifactId"`
+	Version    string `xml:"version"`
+	Scope      string `xml:"scope"`
+	Optional   string `xml:"optional"`
+}
+
+// BFS state:
+type depState struct {
+	Version string
+	Depth   int
+}
+
+// queueItem holds info for BFS plus a pointer to the parent node (so we can attach children).
 type queueItem struct {
-	GroupArtifact string // e.g. "androidx.appcompat/appcompat"
-	Version       string // e.g. "1.4.2"
-	Depth         int    // BFS depth
-	ParentNode    *GradleDependencyNode // Parent node in the dependency tree
+	GroupArtifact string
+	Version       string
+	Depth         int
+	ParentNode    *GradleDependencyNode
 }
 
+// buildTransitiveClosure creates the BFS for each GradleReportSection, constructing a tree.
 func buildTransitiveClosure(sections []GradleReportSection) {
-	for i := range sections {
-		// We'll do BFS for each build.gradle’s direct dependencies
-		stateMap := make(map[string]DepState) // track best version & depth for each group/artifact
-		var queue []*queueItem
+	for si := range sections {
+		section := &sections[si]
+		// We'll build "rootNodes" for direct dependencies
+		var rootNodes []*GradleDependencyNode
+		stateMap := make(map[string]depState) // track best version & BFS depth
+		nodeMap := make(map[string]*GradleDependencyNode) // "group/artifact" -> node
 
-		// Initialize queue with direct dependencies (root nodes of the tree)
-		for _, rootNode := range sections[i].DependencyTree {
-			q := &queueItem{
-				GroupArtifact: rootNode.Name,
-				Version:       rootNode.Version,
-				Depth:         1,
-				ParentNode:    rootNode, // Set parent node to the root node itself initially
+		// Initialize BFS queue with direct dependencies
+		var queue []queueItem
+		for ga, info := range section.Dependencies {
+			// Create a node for the direct dep
+			node := &GradleDependencyNode{
+				Name:     ga,
+				Version:  info.Lookup,
+				Parent:   "direct",
+				Language: "Gradle",
 			}
-			stateMap[rootNode.Name] = DepState{Version: rootNode.Version, Depth: 1}
-			queue = append(queue, q)
+			rootNodes = append(rootNodes, node)
+			nodeMap[ga] = node
+
+			// BFS item
+			queue = append(queue, queueItem{
+				GroupArtifact: ga,
+				Version:       info.Lookup,
+				Depth:         1,
+				ParentNode:    node, // top-level
+			})
+			stateMap[ga] = depState{Version: info.Lookup, Depth: 1}
 		}
 
-		// BFS loop
+		// BFS
 		for len(queue) > 0 {
-			// pop front
-			item := queue[0]
+			it := queue[0]
 			queue = queue[1:]
 
-			gid, aid := splitGA(item.GroupArtifact)
+			gid, aid := splitGA(it.GroupArtifact)
 			if gid == "" || aid == "" {
 				continue
 			}
-
-			// fetch POM
-			pom, err := fetchAndParsePOM(gid, aid, item.Version)
+			pom, err := fetchAndParsePOM(gid, aid, it.Version)
 			if err != nil {
-				// skip
 				continue
 			}
 
-			// gather managedVersions from <dependencyManagement> if present
-			managedVersions := parseManagedVersions(pom)
+			// Attach license info to the node (if not yet attached)
+			curNode := it.ParentNode
+			if curNode != nil {
+				licenseName, projectURL, pomURL := getLicenseInfo(gid, aid, it.Version)
+				curNode.License = licenseName
+				curNode.Details = projectURL
+				curNode.PomURL = pomURL
+				curNode.Copyleft = isCopyleft(licenseName)
+			}
 
-			// For each child <dependency>, see if we should add it to BFS
+			managedVersions := parseDependencyManagement(pom)
+
+			// For each child in the POM's dependencies, see if we BFS them
 			for _, childDep := range pom.Dependencies {
 				if skipDependency(childDep.Scope, childDep.Optional) {
 					continue
 				}
 				childGA := childDep.GroupID + "/" + childDep.ArtifactID
 				childVersion := childDep.Version
-				// if childVersion is missing, check <dependencyManagement>
 				if childVersion == "" {
+					// check managed
 					if mv, ok := managedVersions[childGA]; ok && mv != "" {
 						childVersion = mv
+					} else {
+						childVersion = fallbackVersionFromParent(childDep.GroupID, childDep.ArtifactID, pom)
 					}
 				}
-				// if STILL empty, try parent's groupId/version if the child uses placeholders
 				if childVersion == "" {
-					childVersion = fallbackVersionFromParent(childDep.GroupID, childDep.ArtifactID, pom)
-				}
-				if childVersion == "" {
-					continue // no version found
+					continue
 				}
 
-				// Now apply "nearest-wins" version conflict resolution
-				childDepth := item.Depth + 1
-				curState, exists := stateMap[childGA]
+				childDepth := it.Depth + 1
+				curSt, exists := stateMap[childGA]
 				if !exists {
-					// Not seen yet => store & enqueue and add to tree as child
-					stateMap[childGA] = DepState{Version: childVersion, Depth: childDepth}
-
-					// Create child node
+					// new
+					stateMap[childGA] = depState{Version: childVersion, Depth: childDepth}
+					// create child node
 					childNode := &GradleDependencyNode{
 						Name:     childGA,
 						Version:  childVersion,
-						Parent:   fmt.Sprintf("%s:%s", item.GroupArtifact, item.Version), // Parent for table
-						Language: "gradle",
+						Parent:   fmt.Sprintf("%s:%s", it.GroupArtifact, it.Version),
+						Language: "Gradle",
 					}
-					item.ParentNode.Transitive = append(item.ParentNode.Transitive, childNode) // Add to tree
+					// attach to parent's Transitive slice
+					if it.ParentNode != nil {
+						it.ParentNode.Transitive = append(it.ParentNode.Transitive, childNode)
+					}
+					nodeMap[childGA] = childNode
 
-					queue = append(queue, &queueItem{
+					// enqueue
+					queue = append(queue, queueItem{
 						GroupArtifact: childGA,
 						Version:       childVersion,
 						Depth:         childDepth,
-						ParentNode:    childNode, // Set the new child node as parent for next level
+						ParentNode:    childNode,
 					})
 				} else {
-					// We have seen this GA. If we discovered a shallower path, we override & re-queue
-					if childDepth < curState.Depth {
-						// override
-						stateMap[childGA] = DepState{Version: childVersion, Depth: childDepth}
-						// In tree structure, do we need to update anything? For "nearest wins", we generally keep the first path.
-						// For now, not updating the tree in override case for simplicity, but may need to revisit.
-						queue = append(queue, &queueItem{
+					// we've seen this GA
+					if childDepth < curSt.Depth {
+						// we found a shallower path => override
+						stateMap[childGA] = depState{Version: childVersion, Depth: childDepth}
+						// we may rebuild the child node or re-link it. For simplicity, we just re-link:
+						childNode, ok := nodeMap[childGA]
+						if !ok {
+							childNode = &GradleDependencyNode{
+								Name:     childGA,
+								Version:  childVersion,
+								Parent:   fmt.Sprintf("%s:%s", it.GroupArtifact, it.Version),
+								Language: "Gradle",
+							}
+							nodeMap[childGA] = childNode
+						} else {
+							childNode.Version = childVersion
+							childNode.Parent = fmt.Sprintf("%s:%s", it.GroupArtifact, it.Version)
+						}
+						// attach child to parent's Transitive
+						if it.ParentNode != nil {
+							it.ParentNode.Transitive = append(it.ParentNode.Transitive, childNode)
+						}
+						// re-enqueue
+						queue = append(queue, queueItem{
 							GroupArtifact: childGA,
 							Version:       childVersion,
 							Depth:         childDepth,
-							ParentNode:    item.ParentNode, // Keep same parent for re-queue? Or find existing node and update?
+							ParentNode:    childNode,
 						})
+					} else {
+						// do nothing, we keep the older, shallower version
 					}
 				}
 			}
 		}
 
+		// Sort children by Name for stable output
+		sortTreeNodes(rootNodes)
 
-		// Calculate transitive counts (for table part, can remove later if tree is only output)
-		directCount := 0
-		depMapForSection := make(map[string]ExtendedDepInfo) // Reconstruct depMap for table output
-		var flatten func(nodes []*GradleDependencyNode, parent string)
-		flatten = func(nodes []*GradleDependencyNode, parent string) {
-			for _, node := range nodes {
-				if parent == "direct" {
-					directCount++
-				}
-				depMapForSection[node.Name] = ExtendedDepInfo{
-					DepVersion: DepVersion{Display: node.Version, Lookup: node.Version},
-					Parent:     parent,
-				}
-				flatten(node.Transitive, node.Name) // Correct parent name for transitive
-			}
+		// Store the final tree in the section
+		section.DependencyTree = rootNodes
+
+		// Also fill in "TransitiveCount" for display
+		// We can do a quick DFS to count total nodes minus direct
+		totalCount := 0
+		for _, rn := range rootNodes {
+			totalCount += countNodes(rn)
 		}
-		flatten(sections[i].DependencyTree, "direct") // Start flattening from root nodes
-		sections[i].Dependencies = depMapForSection
-		sections[i].TransitiveCount = len(sections[i].Dependencies) - directCount
+		directCount := len(rootNodes)
+		section.TransitiveCount = totalCount - directCount
 
+		// Also fill ExtendedDepInfo from the actual final BFS tree if we want them consistent
+		for _, rn := range rootNodes {
+			fillExtendedDepMap(rn, section.Dependencies)
+		}
 	}
 }
 
-
-// skipDependency returns true if we should skip test/provided/optional dependencies.
+// skipDependency returns true if scope is test/provided/system or optional is true
 func skipDependency(scope, optional string) bool {
 	s := strings.ToLower(strings.TrimSpace(scope))
 	if s == "test" || s == "provided" || s == "system" {
@@ -392,38 +387,32 @@ func skipDependency(scope, optional string) bool {
 	return false
 }
 
-// parseManagedVersions creates a map of "group/artifact" -> version from <dependencyManagement>.
-func parseManagedVersions(pom *MavenPOM) map[string]string {
-	result := make(map[string]string)
+func parseDependencyManagement(pom *MavenPOM) map[string]string {
+	res := make(map[string]string)
 	for _, d := range pom.DependencyMgmt.Dependencies {
 		if skipDependency(d.Scope, d.Optional) {
 			continue
 		}
-		if d.Version == "" {
-			continue
+		if d.Version != "" {
+			ga := d.GroupID + "/" + d.ArtifactID
+			res[ga] = d.Version
 		}
-		ga := d.GroupID + "/" + d.ArtifactID
-		result[ga] = d.Version
 	}
-	return result
+	return res
 }
 
-// fallbackVersionFromParent tries to see if the child matches the POM’s <groupId> or the parent's groupId
-// if the child simply omitted <version>. This is very naive parent inheritance logic.
-func fallbackVersionFromParent(childGroup, childArtifact string, pom *MavenPOM) string {
-	parentGroup := pom.Parent.GroupID
-	parentVersion := pom.Parent.Version
-
-	if childGroup == pom.GroupID && pom.Version != "" {
+func fallbackVersionFromParent(g, a string, pom *MavenPOM) string {
+	pg := pom.Parent.GroupID
+	pv := pom.Parent.Version
+	if g == pom.GroupID && pom.Version != "" {
 		return pom.Version
 	}
-	if childGroup == parentGroup && parentVersion != "" {
-		return parentVersion
+	if g == pg && pv != "" {
+		return pv
 	}
 	return ""
 }
 
-// splitGA splits "group/artifact" into (group, artifact).
 func splitGA(ga string) (string, string) {
 	parts := strings.Split(ga, "/")
 	if len(parts) != 2 {
@@ -432,13 +421,51 @@ func splitGA(ga string) (string, string) {
 	return parts[0], parts[1]
 }
 
+// fillExtendedDepMap updates the Dependencies map with final version info from the node tree
+func fillExtendedDepMap(node *GradleDependencyNode, depMap map[string]ExtendedDepInfo) {
+	key := node.Name
+	info, ok := depMap[key]
+	if !ok {
+		info = ExtendedDepInfo{
+			Display: node.Version,
+			Lookup:  node.Version,
+			Parent:  node.Parent,
+		}
+	} else {
+		info.Display = node.Version
+		info.Lookup  = node.Version
+		info.Parent  = node.Parent
+	}
+	depMap[key] = info
+	for _, child := range node.Transitive {
+		fillExtendedDepMap(child, depMap)
+	}
+}
+
+func countNodes(root *GradleDependencyNode) int {
+	count := 1
+	for _, c := range root.Transitive {
+		count += countNodes(c)
+	}
+	return count
+}
+
+func sortTreeNodes(nodes []*GradleDependencyNode) {
+	// Sort current level
+	sort.Slice(nodes, func(i, j int) bool {
+		return nodes[i].Name < nodes[j].Name
+	})
+	// Recursively sort children
+	for _, n := range nodes {
+		sortTreeNodes(n.Transitive)
+	}
+}
+
 // -------------------------------------------------------------------------------------
-// POM Fetching and Caching
+// POM FETCH/CACHE
 // -------------------------------------------------------------------------------------
 
-// fetchAndParsePOM fetches the POM from either Maven Central or Google, plus checks <parent> if needed.
 func fetchAndParsePOM(groupID, artifactID, version string) (*MavenPOM, error) {
-	// If we have it in cache, return
 	key := fmt.Sprintf("%s:%s:%s", groupID, artifactID, version)
 	if cached, ok := pomCache.Load(key); ok {
 		return cached.(*MavenPOM), nil
@@ -449,7 +476,7 @@ func fetchAndParsePOM(groupID, artifactID, version string) (*MavenPOM, error) {
 		return nil, err
 	}
 
-	// Attempt to fill the local groupId/version from <parent> if missing
+	// fill groupId, version if missing from parent
 	if pom.GroupID == "" {
 		pom.GroupID = pom.Parent.GroupID
 	}
@@ -457,31 +484,27 @@ func fetchAndParsePOM(groupID, artifactID, version string) (*MavenPOM, error) {
 		pom.Version = pom.Parent.Version
 	}
 
-	// If the POM has a parent, we parse that parent's POM for <dependencyManagement> too.
-	// Then we can merge. This is a partial approach.
+	// if there's a parent, retrieve it
 	if pom.Parent.GroupID != "" && pom.Parent.ArtifactID != "" && pom.Parent.Version != "" {
 		parentKey := fmt.Sprintf("%s:%s:%s", pom.Parent.GroupID, pom.Parent.ArtifactID, pom.Parent.Version)
-		parentPOM, ok := pomCache.Load(parentKey)
-		var parent *MavenPOM
-		if !ok {
-			// fetch parent's POM
-			parent, _ = retrievePOM(pom.Parent.GroupID, pom.Parent.ArtifactID, pom.Parent.Version)
-			if parent != nil {
-				// store
-				pomCache.Store(parentKey, parent)
-			}
+		var parentPOM *MavenPOM
+		if p, ok := pomCache.Load(parentKey); ok {
+			parentPOM = p.(*MavenPOM)
 		} else {
-			parent = parentPOM.(*MavenPOM)
+			parentPOM, _ = retrievePOM(pom.Parent.GroupID, pom.Parent.ArtifactID, pom.Parent.Version)
+			if parentPOM != nil {
+				pomCache.Store(parentKey, parentPOM)
+			}
 		}
-		// If we found a parent, merge parent's <dependencyManagement> into this POM's <dependencyManagement>
-		if parent != nil {
-			pom.DependencyMgmt.Dependencies = mergeDepMgmt(parent.DependencyMgmt.Dependencies, pom.DependencyMgmt.Dependencies)
-			// If after that we still have no groupId, version, use parent's
+		if parentPOM != nil {
+			// merge <dependencyManagement>
+			pom.DependencyMgmt.Dependencies = mergeDepMgmt(parentPOM.DependencyMgmt.Dependencies, pom.DependencyMgmt.Dependencies)
+			// if still missing groupId/version, fill from parent
 			if pom.GroupID == "" {
-				pom.GroupID = parent.GroupID
+				pom.GroupID = parentPOM.GroupID
 			}
 			if pom.Version == "" {
-				pom.Version = parent.Version
+				pom.Version = parentPOM.Version
 			}
 		}
 	}
@@ -490,7 +513,6 @@ func fetchAndParsePOM(groupID, artifactID, version string) (*MavenPOM, error) {
 	return pom, nil
 }
 
-// retrievePOM tries Maven Central then Google Maven
 func retrievePOM(groupID, artifactID, version string) (*MavenPOM, error) {
 	groupPath := strings.ReplaceAll(groupID, ".", "/")
 	centralURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom",
@@ -507,14 +529,13 @@ func retrievePOM(groupID, artifactID, version string) (*MavenPOM, error) {
 	return nil, fmt.Errorf("unable to fetch POM for %s:%s:%s", groupID, artifactID, version)
 }
 
-// fetchPOMFromURL fetches and unmarshals a Maven POM from a given URL
 func fetchPOMFromURL(url string) (*MavenPOM, error) {
 	resp, err := http.Get(url)
 	if err != nil {
-		return nil, fmt.Errorf("GET error for %s: %v", url, err)
+		return nil, err
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
 	}
 	data, err := io.ReadAll(resp.Body)
@@ -525,30 +546,25 @@ func fetchPOMFromURL(url string) (*MavenPOM, error) {
 	dec := xml.NewDecoder(bytes.NewReader(data))
 	dec.Strict = false
 	if err := dec.Decode(&pom); err != nil {
-		return nil, fmt.Errorf("XML decode error: %v", err)
+		return nil, err
 	}
 	return &pom, nil
 }
 
-// mergeDepMgmt merges parent's <dependencyManagement> entries with child's. Child entries override parent's if same G/A.
 func mergeDepMgmt(parent, child []POMDep) []POMDep {
-	// build a map from parent's
 	outMap := make(map[string]POMDep)
 	for _, d := range parent {
 		key := d.GroupID + ":" + d.ArtifactID
 		outMap[key] = d
 	}
-	// child overrides
 	for _, d := range child {
 		key := d.GroupID + ":" + d.ArtifactID
 		outMap[key] = d
 	}
-	// convert back to slice
 	var merged []POMDep
 	for _, val := range outMap {
 		merged = append(merged, val)
 	}
-	// sort for stable output
 	sort.Slice(merged, func(i, j int) bool {
 		return merged[i].GroupID < merged[j].GroupID
 	})
@@ -556,30 +572,24 @@ func mergeDepMgmt(parent, child []POMDep) []POMDep {
 }
 
 // -------------------------------------------------------------------------------------
-// Step 3: License Lookup & Copyleft
+// STEP 3: LICENSE LOOKUP & COPYLEFT DETECTION
 // -------------------------------------------------------------------------------------
 
-// getLicenseInfo returns (licenseName, projectURL, POMFileURL).
 func getLicenseInfo(groupID, artifactID, version string) (string, string, string) {
-	// Try to fetch the POM (cached or live). If fail => unknown
 	pom, err := fetchAndParsePOM(groupID, artifactID, version)
 	if err != nil || pom == nil {
 		return "Unknown", fmt.Sprintf("https://www.google.com/search?q=%s+%s+%s+license", groupID, artifactID, version), ""
 	}
-	// We'll guess that the best "project URL" is the location from Maven Central if found.
 	groupPath := strings.ReplaceAll(groupID, ".", "/")
 	centralURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/", groupPath, artifactID, version)
-	pomURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom",
-		groupPath, artifactID, version, artifactID, version)
+	pomURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, artifactID, version, artifactID, version)
 
-	licenseName := "Unknown"
 	if len(pom.Licenses) > 0 {
-		licenseName = pom.Licenses[0].Name
+		return pom.Licenses[0].Name, centralURL, pomURL
 	}
-	return licenseName, centralURL, pomURL
+	return "Unknown", centralURL, pomURL
 }
 
-// isCopyleft checks for known copyleft license keywords
 func isCopyleft(licenseName string) bool {
 	copyleftKeywords := []string{
 		"GPL", "LGPL", "AGPL", "CC BY-SA", "CC-BY-SA", "MPL", "EPL", "CPL",
@@ -602,175 +612,204 @@ func isCopyleft(licenseName string) bool {
 	return false
 }
 
-// getLicenseInfoWrapper returns a single struct for template usage
+// A helper function for templates that returns a single object
 func getLicenseInfoWrapper(dep, version string) LicenseData {
 	parts := strings.Split(dep, "/")
 	if len(parts) != 2 {
 		return LicenseData{LicenseName: "Unknown"}
 	}
 	g, a := parts[0], parts[1]
-	licName, projURL, pomURL := getLicenseInfo(g, a, version)
+	lic, proj, pom := getLicenseInfo(g, a, version)
 	return LicenseData{
-		LicenseName: licName,
-		ProjectURL:  projURL,
-		PomURL:      pomURL,
+		LicenseName: lic,
+		ProjectURL:  proj,
+		PomURL:      pom,
 	}
 }
 
 // -------------------------------------------------------------------------------------
-// Step 4: HTML Report - with Tree View
+// STEP 4: TREE RENDERING TO HTML (<details> / <summary>)
 // -------------------------------------------------------------------------------------
 
-func buildGradleTreeHTML(gd *GradleDependencyNode) string {
-	licInfo := getLicenseInfoWrapper(gd.Name, gd.Version)
-	sum := fmt.Sprintf("%s@%s (License: %s)", gd.Name, gd.Version, licInfo.LicenseName)
+// buildGradleTreesHTML renders multiple root nodes (direct dependencies) as separate <details> blocks.
+func buildGradleTreesHTML(nodes []*GradleDependencyNode) template.HTML {
+	var buf strings.Builder
+	for _, node := range nodes {
+		html := buildGradleTreeHTML(node, 0)
+		buf.WriteString(html)
+	}
+	return template.HTML(buf.String())
+}
+
+// buildGradleTreeHTML recursively builds <details><summary> for the given node and its children.
+// We'll add a CSS class for copyleft, unknown, etc. for color-coding in the tree as well.
+func buildGradleTreeHTML(node *GradleDependencyNode, level int) string {
+	// Decide a CSS class for the license
+	class := "non-copyleft"
+	if node.License == "Unknown" {
+		class = "unknown-license"
+	} else if node.Copyleft {
+		class = "copyleft"
+	}
+	// We'll format the summary line as: name@version (License: X)
+	summaryLine := fmt.Sprintf("%s@%s (License: %s)", node.Name, node.Version, node.License)
+
+	// Build the <summary> with class
 	var sb strings.Builder
-	sb.WriteString("<details><summary>")
-	sb.WriteString(template.HTMLEscapeString(sum))
-	sb.WriteString("</summary>\n")
-	if len(gd.Transitive) > 0 {
-		sb.WriteString("<ul>\n")
-		for _, ch := range gd.Transitive {
-			sb.WriteString("<li>")
-			sb.WriteString(buildGradleTreeHTML(ch))
-			sb.WriteString("</li>\n")
+	sb.WriteString(fmt.Sprintf(`<details class="%s" style="margin-left:%dem;">`, class, level))
+	sb.WriteString(fmt.Sprintf(`<summary>%s</summary>`, template.HTMLEscapeString(summaryLine)))
+
+	// If there's a POM or details link, we can optionally show them in a small line
+	if node.PomURL != "" || node.Details != "" {
+		sb.WriteString("<div style='margin-left:2em; font-size:0.9em;'>")
+		if node.Details != "" {
+			sb.WriteString(fmt.Sprintf(`<a href="%s" target="_blank">Project Details</a> &nbsp;`, template.HTMLEscapeString(node.Details)))
 		}
-		sb.WriteString("</ul>\n")
+		if node.PomURL != "" {
+			sb.WriteString(fmt.Sprintf(`<a href="%s" target="_blank">POM File</a>`, template.HTMLEscapeString(node.PomURL)))
+		}
+		sb.WriteString("</div>")
 	}
-	sb.WriteString("</details>\n")
+
+	// Recursively build children
+	for _, child := range node.Transitive {
+		sb.WriteString(buildGradleTreeHTML(child, level+1))
+	}
+	sb.WriteString("</details>")
 	return sb.String()
 }
 
-func buildGradleTreesHTML(nodes []*GradleDependencyNode) string {
-	if len(nodes) == 0 {
-		return "<p>No Gradle dependencies found.</p>"
-	}
-	var sb strings.Builder
-	for _, gd := range nodes {
-		sb.WriteString(buildGradleTreeHTML(gd))
-	}
-	return sb.String()
-}
-
+// -------------------------------------------------------------------------------------
+// STEP 5: HTML REPORT GENERATION
+// -------------------------------------------------------------------------------------
 
 func generateHTMLReport(sections []GradleReportSection) error {
 	outputDir := "./license-checker"
 	if _, err := os.Stat(outputDir); os.IsNotExist(err) {
 		if err := os.Mkdir(outputDir, 0755); err != nil {
-			return fmt.Errorf("error creating output directory: %v", err)
+			return err
 		}
 	}
 
 	const tmplText = `<!DOCTYPE html>
 <html>
 <head>
-	<meta charset="UTF-8">
-	<title>Kotlin Dependency License Report</title>
-	<style>
-		body { font-family: Arial, sans-serif; margin: 20px; }
-		h1 { color: #2c3e50; }
-		h2 { color: #34495e; margin-top: 40px; }
-		table { width: 100%; border-collapse: collapse; margin-bottom: 40px; }
-		th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
-		th { background-color: #f2f2f2; }
-		tr:nth-child(even) { background-color: #f9f9f9; }
-		a { color: #3498db; text-decoration: none; }
-		a:hover { text-decoration: underline; }
-		tr.copyleft { background-color: #ffdddd; }
-		tr.non-copyleft { background-color: #ddffdd; }
-		tr.unknown-license { background-color: #ffffdd; }
-		.small { color: #666; font-size: 0.9em; }
-		details{margin:4px 0}
-		summary{cursor:pointer;font-weight:bold}
-	</style>
+    <meta charset="UTF-8">
+    <title>Gradle Dependency Tree Report</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        h1 { color: #2c3e50; }
+        h2 { margin-top: 40px; }
+        table { width: 100%; border-collapse: collapse; margin-bottom: 40px; }
+        th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+        th { background-color: #f2f2f2; }
+        tr:nth-child(even) { background-color: #f9f9f9; }
+        a { color: #3498db; text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        tr.copyleft { background-color: #ffdddd; }
+        tr.non-copyleft { background-color: #ddffdd; }
+        tr.unknown-license { background-color: #ffffdd; }
+
+        /* For the tree: color the <summary> if copyleft, etc. */
+        details.copyleft > summary {
+            background-color: #ffdddd;
+            padding: 2px 4px;
+            border-radius: 4px;
+        }
+        details.unknown-license > summary {
+            background-color: #ffffdd;
+            padding: 2px 4px;
+            border-radius: 4px;
+        }
+        details.non-copyleft > summary {
+            background-color: #ddffdd;
+            padding: 2px 4px;
+            border-radius: 4px;
+        }
+    </style>
 </head>
 <body>
-	<h1>Kotlin Dependency License Report (Recursive POM Parsing + Parent Inheritance + Nearest-Wins)</h1>
+    <h1>Gradle Dependency License Report</h1>
+    <p>This report includes both a table of dependencies and a tree-based view using <code>&lt;details&gt;</code> / <code>&lt;summary&gt;</code> elements.</p>
 
-	<p class="small">This report includes version conflict resolution (nearest-wins) & parent POM inheritance
-		for missing dependency versions. Test/optional/provided dependencies are skipped.
-		We do not handle custom repositories or advanced parent inheritance beyond the immediate parent.
-		Real Maven/Gradle logic is more complex.</p>
+    {{range .}}
+        <h2>File: {{.FilePath}}</h2>
+        <p>Total Dependencies Found: {{len .Dependencies}} ({{.TransitiveCount}} transitive)</p>
 
-	{{range .}}
-		<h2>File: {{.FilePath}}</h2>
-		<p>Total Dependencies Found: {{len .Dependencies}}
-			({{.TransitiveCount}} transitive)</p>
-		<table>
-			<thead>
-				<tr>
-					<th>Dependency (group/artifact)</th>
-					<th>Version</th>
-					<th>License</th>
-					<th>Parent</th>
-					<th>Project Details</th>
-					<th>POM File</th>
-				</tr>
-			</thead>
-			<tbody>
-				{{range $dep, $info := .Dependencies}}
-				{{ $licenseData := getLicenseInfoWrapper $dep $info.Lookup }}
-					{{ if eq $licenseData.LicenseName "Unknown" }}
-						<tr class="unknown-license">
-					{{ else if isCopyleft $licenseData.LicenseName }}
-						<tr class="copyleft">
-					{{ else }}
-						<tr class="non-copyleft">
-					{{ end }}
-						<td>{{$dep}}</td>
-						<td>{{$info.Display}}</td>
-						<td>{{$licenseData.LicenseName}}</td>
-						<td>{{$info.Parent}}</td>
-						{{if $licenseData.ProjectURL}}
-							<td><a href="{{$licenseData.ProjectURL}}" target="_blank">View Details</a></td>
-						{{else}}
-							<td></td>
-						{{end}}
-						{{if $licenseData.PomURL}}
-							<td><a href="{{$licenseData.PomURL}}" target="_blank">View POM</a></td>
-						{{else}}
-							<td></td>
-						{{end}}
-					</tr>
-				{{end}}
-			</tbody>
-		</table>
+        <h3>Gradle Dependencies Tree View</h3>
+        {{ buildGradleTreesHTML .DependencyTree }}
 
-		<h2>Gradle Dependencies Tree View</h2>
-		<div>
-			{{ buildGradleTreesHTML .DependencyTree }}
-		</div>
+        <h3>Flat Dependencies Table</h3>
+        <table>
+            <thead>
+                <tr>
+                    <th>Dependency</th>
+                    <th>Version</th>
+                    <th>License</th>
+                    <th>Parent</th>
+                    <th>Project Details</th>
+                    <th>POM File</th>
+                </tr>
+            </thead>
+            <tbody>
+                {{ range $dep, $info := .Dependencies }}
+                    {{ $licData := getLicenseInfoWrapper $dep $info.Lookup }}
+                    {{ if eq $licData.LicenseName "Unknown" }}
+                        <tr class="unknown-license">
+                    {{ else if isCopyleft $licData.LicenseName }}
+                        <tr class="copyleft">
+                    {{ else }}
+                        <tr class="non-copyleft">
+                    {{ end }}
+                        <td>{{$dep}}</td>
+                        <td>{{$info.Display}}</td>
+                        <td>{{$licData.LicenseName}}</td>
+                        <td>{{$info.Parent}}</td>
+                        {{if $licData.ProjectURL}}
+                          <td><a href="{{$licData.ProjectURL}}" target="_blank">View Details</a></td>
+                        {{else}}
+                          <td></td>
+                        {{end}}
+                        {{if $licData.PomURL}}
+                          <td><a href="{{$licData.PomURL}}" target="_blank">View POM</a></td>
+                        {{else}}
+                          <td></td>
+                        {{end}}
+                    </tr>
+                {{ end }}
+            </tbody>
+        </table>
 
-	{{end}}
+    {{end}}
 </body>
 </html>`
 
 	tmpl, err := template.New("report").Funcs(template.FuncMap{
+		"buildGradleTreesHTML": buildGradleTreesHTML,
+		"isCopyleft":           isCopyleft,
 		"getLicenseInfoWrapper": getLicenseInfoWrapper,
-		"isCopyleft":          isCopyleft,
-		"buildGradleTreesHTML":  buildGradleTreesHTML, // Make the tree HTML function available in template
 	}).Parse(tmplText)
 	if err != nil {
-		return fmt.Errorf("template parse error: %v", err)
+		return err
 	}
 
-	reportPath := filepath.Join(outputDir, "dependency-license-report.html")
-	file, err := os.Create(reportPath)
+	reportFile := filepath.Join(outputDir, "dependency-license-report.html")
+	f, err := os.Create(reportFile)
 	if err != nil {
-		return fmt.Errorf("error creating report file: %v", err)
+		return err
 	}
-	defer file.Close()
+	defer f.Close()
 
-	if err := tmpl.Execute(file, sections); err != nil {
-		return fmt.Errorf("error executing template: %v", err)
+	if err := tmpl.Execute(f, sections); err != nil {
+		return err
 	}
 
-	fmt.Printf("✅ License report generated at %s\n", reportPath)
+	fmt.Printf("✅ Report generated at %s\n", reportFile)
 	return nil
 }
 
 // -------------------------------------------------------------------------------------
-// main()
+// MAIN
 // -------------------------------------------------------------------------------------
 
 func main() {
@@ -779,7 +818,7 @@ func main() {
 		fmt.Printf("Error finding build.gradle files: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Found %d build.gradle file(s).\n", len(files))
+	fmt.Printf("Found %d build.gradle file(s)\n", len(files))
 
 	sections, err := parseAllBuildGradleFiles(files)
 	if err != nil {
@@ -787,7 +826,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Build the full transitive closure with BFS + nearest-wins + parent POM logic
 	buildTransitiveClosure(sections)
 
 	if err := generateHTMLReport(sections); err != nil {
