@@ -21,10 +21,10 @@ import (
 // -------------------------------------------------------------------------------------
 
 const (
-	localPOMCacheDir = ".pom-cache"     // Directory for disk caching of POMs
-	pomWorkerCount   = 10               // Number of concurrent POM fetch workers
-	maxParentDepth   = 10               // Maximum parent POM resolution depth
-	fetchTimeout     = 10 * time.Second // Timeout per HTTP request
+	localPOMCacheDir = ".pom-cache"          // Directory for disk caching of POMs
+	pomWorkerCount   = 10                    // Number of concurrent POM fetch workers
+	maxParentDepth   = 10                    // Maximum parent POM resolution depth
+	fetchTimeout     = 30 * time.Second      // Increased HTTP request timeout to 30 seconds
 )
 
 // -------------------------------------------------------------------------------------
@@ -132,7 +132,6 @@ var (
 	pomRequests = make(chan fetchRequest, 50)
 	wgWorkers   sync.WaitGroup
 
-	// A simple SPDX license mapping (expand as needed)
 	spdxLicenseMap = map[string]struct {
 		Name     string
 		Copyleft bool
@@ -157,11 +156,12 @@ var (
 func pomFetchWorker() {
 	defer wgWorkers.Done()
 	for req := range pomRequests {
-		fmt.Printf("Worker: Fetching POM for %s:%s:%s at %s\n", req.GroupID, req.ArtifactID, req.Version, time.Now().Format(time.RFC3339))
+		fmt.Printf("Worker: Starting fetch for %s:%s:%s at %s\n", req.GroupID, req.ArtifactID, req.Version, time.Now().Format(time.RFC3339))
 		pom, err := retrieveOrLoadPOM(req.GroupID, req.ArtifactID, req.Version)
 		if err != nil {
-			fmt.Printf("⚠️ Error in worker fetching POM for %s:%s:%s: %v\n", req.GroupID, req.ArtifactID, req.Version, err)
+			fmt.Printf("⚠️ Worker: Error fetching POM for %s:%s:%s: %v\n", req.GroupID, req.ArtifactID, req.Version, err)
 		}
+		fmt.Printf("Worker: Completed fetch for %s:%s:%s at %s (POM exists: %v)\n", req.GroupID, req.ArtifactID, req.Version, time.Now().Format(time.RFC3339), pom != nil)
 		req.ResultChan <- fetchResult{POM: pom, Err: err}
 	}
 }
@@ -313,7 +313,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 			}
 			pom, err := concurrentFetchPOM(gid, aid, it.Version)
 			if err != nil || pom == nil {
-				fmt.Printf("BFS: Skipping %s:%s:%s due to error at %s.\n", gid, aid, it.Version, time.Now().Format(time.RFC3339))
+				fmt.Printf("BFS: Skipping %s:%s:%s due to error at %s\n", gid, aid, it.Version, time.Now().Format(time.RFC3339))
 				continue
 			}
 			if it.ParentNode != nil {
@@ -530,13 +530,18 @@ func isCopyleft(name string) bool {
 // -------------------------------------------------------------------------------------
 
 func concurrentFetchPOM(g, a, v string) (*MavenPOM, error) {
+	fmt.Printf("concurrentFetchPOM: Request for %s:%s:%s at %s\n", g, a, v, time.Now().Format(time.RFC3339))
 	if g == "" || a == "" || v == "" {
-		return nil, fmt.Errorf("invalid GAV: %s:%s:%s", g, a, v)
+		err := fmt.Errorf("invalid GAV: %s:%s:%s", g, a, v)
+		fmt.Printf("concurrentFetchPOM: %v\n", err)
+		return nil, err
 	}
 	key := fmt.Sprintf("%s:%s:%s", g, a, v)
 	if c, ok := pomCache.Load(key); ok {
+		fmt.Printf("concurrentFetchPOM: Cache HIT for %s\n", key)
 		return c.(*MavenPOM), nil
 	}
+	fmt.Printf("concurrentFetchPOM: Cache MISS for %s, sending fetch request\n", key)
 	resultChan := make(chan fetchResult, 1)
 	pomRequests <- fetchRequest{
 		GroupID:    g,
@@ -546,35 +551,44 @@ func concurrentFetchPOM(g, a, v string) (*MavenPOM, error) {
 	}
 	res := <-resultChan
 	if res.Err != nil {
-		fmt.Printf("⚠️ Error fetching POM for %s:%s:%s: %v\n", g, a, v, res.Err)
+		fmt.Printf("concurrentFetchPOM: Error for %s:%s:%s: %v\n", g, a, v, res.Err)
 		return nil, nil
 	}
 	if res.POM == nil {
-		fmt.Printf("⚠️ No POM found for %s:%s:%s\n", g, a, v)
+		fmt.Printf("concurrentFetchPOM: No POM found for %s:%s:%s\n", g, a, v)
 		return nil, nil
 	}
 	pomCache.Store(key, res.POM)
+	fmt.Printf("concurrentFetchPOM: Successfully fetched and cached POM for %s:%s:%s\n", g, a, v)
 	return res.POM, nil
 }
 
 func retrieveOrLoadPOM(g, a, v string) (*MavenPOM, error) {
+	fmt.Printf("retrieveOrLoadPOM: Request for %s:%s:%s at %s\n", g, a, v, time.Now().Format(time.RFC3339))
 	key := fmt.Sprintf("%s:%s:%s", g, a, v)
 	if c, ok := pomCache.Load(key); ok {
+		fmt.Printf("retrieveOrLoadPOM: Cache HIT for %s\n", key)
 		return c.(*MavenPOM), nil
 	}
+	fmt.Printf("retrieveOrLoadPOM: Cache MISS for %s, trying disk load\n", key)
 	pom, err := loadPOMFromDisk(g, a, v)
 	if err == nil && pom != nil {
 		pomCache.Store(key, pom)
-	} else {
-		pom, err = fetchRemotePOM(g, a, v)
-		if err != nil {
-			return nil, err
-		}
-		_ = savePOMToDisk(g, a, v, pom)
-		pomCache.Store(key, pom)
+		fmt.Printf("retrieveOrLoadPOM: Disk load success for %s\n", key)
+		return pom, nil
 	}
+	fmt.Printf("retrieveOrLoadPOM: Disk load failed for %s: %v. Trying remote fetch...\n", key, err)
+	pom, err = fetchRemotePOM(g, a, v)
+	if err != nil {
+		fmt.Printf("retrieveOrLoadPOM: Remote fetch FAILED for %s:%s:%s: %v\n", g, a, v, err)
+		return nil, err
+	}
+	_ = savePOMToDisk(g, a, v, pom)
+	pomCache.Store(key, pom)
 	if pom == nil {
-		return nil, fmt.Errorf("no POM for %s", key)
+		errNoPOM := fmt.Errorf("no POM for %s", key)
+		fmt.Printf("retrieveOrLoadPOM: %v\n", errNoPOM)
+		return nil, errNoPOM
 	}
 	if pom.GroupID == "" {
 		pom.GroupID = pom.Parent.GroupID
@@ -584,8 +598,9 @@ func retrieveOrLoadPOM(g, a, v string) (*MavenPOM, error) {
 	}
 	err = loadAllParents(pom, 0)
 	if err != nil {
-		fmt.Printf("⚠️ Parent loading issue for %s:%s:%s: %v\n", g, a, v, err)
+		fmt.Printf("retrieveOrLoadPOM: Error loading parent POMs for %s:%s:%s: %v\n", g, a, v, err)
 	}
+	fmt.Printf("retrieveOrLoadPOM: Returning POM for %s:%s:%s at %s\n", g, a, v, time.Now().Format(time.RFC3339))
 	return pom, nil
 }
 
@@ -616,32 +631,43 @@ func loadAllParents(p *MavenPOM, depth int) error {
 }
 
 func fetchRemotePOM(g, a, v string) (*MavenPOM, error) {
+	fmt.Printf("fetchRemotePOM: Attempting remote fetch for %s:%s:%s at %s\n", g, a, v, time.Now().Format(time.RFC3339))
 	groupPath := strings.ReplaceAll(g, ".", "/")
 	urlCentral := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
 	urlGoogle := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
+	fmt.Printf("fetchRemotePOM: Trying Maven Central URL: %s\n", urlCentral)
 	if pm, err := fetchPOMFromURL(urlCentral); err == nil {
-		fmt.Printf("Fetched POM from Maven Central for %s:%s:%s at %s\n", g, a, v, time.Now().Format(time.RFC3339))
+		fmt.Printf("fetchRemotePOM: Successfully fetched from Maven Central for %s:%s:%s at %s\n", g, a, v, time.Now().Format(time.RFC3339))
 		return pm, nil
+	} else {
+		fmt.Printf("fetchRemotePOM: Maven Central fetch failed: %v\n", err)
 	}
+	fmt.Printf("fetchRemotePOM: Trying Google Maven URL: %s\n", urlGoogle)
 	if pm, err := fetchPOMFromURL(urlGoogle); err == nil {
-		fmt.Printf("Fetched POM from Google Maven for %s:%s:%s at %s\n", g, a, v, time.Now().Format(time.RFC3339))
+		fmt.Printf("fetchRemotePOM: Successfully fetched from Google Maven for %s:%s:%s at %s\n", g, a, v, time.Now().Format(time.RFC3339))
 		return pm, nil
+	} else {
+		fmt.Printf("fetchRemotePOM: Google Maven fetch failed: %v\n", err)
 	}
-	return nil, fmt.Errorf("could not fetch remote POM for %s:%s:%s", g, a, v)
+	errRemote := fmt.Errorf("could not fetch remote POM for %s:%s:%s", g, a, v)
+	fmt.Printf("fetchRemotePOM: %v\n", errRemote)
+	return nil, errRemote
 }
 
 func fetchPOMFromURL(url string) (*MavenPOM, error) {
-	fmt.Printf("DEBUG: Starting HTTP request to %s at %s\n", url, time.Now().Format(time.RFC3339))
+	fmt.Printf("fetchPOMFromURL: Starting HTTP request to %s at %s\n", url, time.Now().Format(time.RFC3339))
 	client := http.Client{Timeout: fetchTimeout}
 	resp, err := client.Get(url)
 	if err != nil {
-		fmt.Printf("DEBUG: Error during HTTP GET for %s: %v\n", url, err)
+		fmt.Printf("fetchPOMFromURL: Error fetching %s: %v\n", url, err)
 		return nil, err
 	}
 	defer resp.Body.Close()
-	fmt.Printf("DEBUG: HTTP GET for %s returned status %d at %s\n", url, resp.StatusCode, time.Now().Format(time.RFC3339))
+	fmt.Printf("fetchPOMFromURL: Received HTTP %d for %s at %s\n", resp.StatusCode, url, time.Now().Format(time.RFC3339))
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
+		errStatus := fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
+		fmt.Printf("fetchPOMFromURL: %v\n", errStatus)
+		return nil, errStatus
 	}
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -651,8 +677,10 @@ func fetchPOMFromURL(url string) (*MavenPOM, error) {
 	dec := xml.NewDecoder(bytes.NewReader(data))
 	dec.Strict = false
 	if err := dec.Decode(&pom); err != nil {
+		fmt.Printf("fetchPOMFromURL: XML decode error for %s: %v\n", url, err)
 		return nil, err
 	}
+	fmt.Printf("fetchPOMFromURL: Successfully fetched and decoded POM from %s\n", url)
 	return &pom, nil
 }
 
@@ -923,6 +951,13 @@ func printTreeNode(node *GradleDependencyNode, indent int) {
 func main() {
 	defer close(pomRequests)
 	defer wgWorkers.Wait()
+	
+	// Start worker pool.
+	for i := 0; i < pomWorkerCount; i++ {
+		wgWorkers.Add(1)
+		go pomFetchWorker()
+	}
+	
 	fmt.Println("Starting dependency analysis...")
 	files, err := findBuildGradleFiles(".")
 	if err != nil {
