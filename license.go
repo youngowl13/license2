@@ -21,11 +21,10 @@ import (
 // -------------------------------------------------------------------------------------
 
 const (
-	localPOMCacheDir = ".pom-cache"         // Directory for disk caching of POMs
-	pomWorkerCount   = 10                   // Number of concurrent POM fetch workers
-	maxParentDepth   = 10                   // Maximum parent POM resolution depth
-	fetchTimeout     = 10 * time.Second     // Timeout per HTTP request
-	globalTimeout    = 20 * time.Minute     // Overall timeout (if needed)
+	localPOMCacheDir = ".pom-cache"     // Directory for disk caching of POMs
+	pomWorkerCount   = 10               // Number of concurrent POM fetch workers
+	maxParentDepth   = 10               // Maximum parent POM resolution depth
+	fetchTimeout     = 10 * time.Second // HTTP request timeout
 )
 
 // -------------------------------------------------------------------------------------
@@ -38,7 +37,7 @@ type GradleDependencyNode struct {
 	Version    string
 	License    string
 	Copyleft   bool
-	Parent     string
+	Parent     string // "direct" for direct dependencies or parent's GAV for transitive ones.
 	Transitive []*GradleDependencyNode
 }
 
@@ -49,15 +48,15 @@ type ExtendedDepInfo struct {
 	Parent  string // "direct" or parent's GAV
 }
 
-// GradleReportSection represents a report for one build.gradle file.
+// GradleReportSection holds the results for one build.gradle file.
 type GradleReportSection struct {
 	FilePath        string
 	Dependencies    map[string]ExtendedDepInfo // Flat map after BFS resolution
-	DependencyTree  []*GradleDependencyNode    // Hierarchical tree of dependencies
+	DependencyTree  []*GradleDependencyNode    // Hierarchical dependency tree
 	TransitiveCount int                        // Count of transitive dependencies
 }
 
-// MavenPOM is the minimal structure we parse from a POM file.
+// MavenPOM is the minimal structure parsed from a POM file.
 type MavenPOM struct {
 	XMLName        xml.Name `xml:"project"`
 	Parent         POMParent   `xml:"parent"`
@@ -95,7 +94,7 @@ type depState struct {
 	Depth   int
 }
 
-// queueItem is used in BFS.
+// queueItem is used in the BFS.
 type queueItem struct {
 	GroupArtifact string
 	Version       string
@@ -133,7 +132,7 @@ var (
 	pomRequests = make(chan fetchRequest, 50)
 	wgWorkers   sync.WaitGroup
 
-	// A simple SPDX license mapping (expand as needed)
+	// A simple SPDX mapping (expand as needed)
 	spdxLicenseMap = map[string]struct {
 		Name     string
 		Copyleft bool
@@ -156,21 +155,18 @@ var (
 // -------------------------------------------------------------------------------------
 
 func init() {
-	// Ensure the local POM cache directory exists.
 	_ = os.MkdirAll(localPOMCacheDir, 0755)
-	// Start pomWorkerCount concurrent workers.
 	wgWorkers.Add(pomWorkerCount)
 	for i := 0; i < pomWorkerCount; i++ {
 		go pomFetchWorker()
 	}
 }
 
-// pomFetchWorker processes fetchRequests from the pomRequests channel.
+// pomFetchWorker processes fetchRequests from the pomRequests channel concurrently.
 func pomFetchWorker() {
 	defer wgWorkers.Done()
 	for req := range pomRequests {
 		pom, err := retrieveOrLoadPOM(req.GroupID, req.ArtifactID, req.Version)
-		// Log errors gracefully.
 		if err != nil {
 			fmt.Printf("⚠️ Error fetching POM for %s:%s:%s: %v\n", req.GroupID, req.ArtifactID, req.Version, err)
 		}
@@ -179,7 +175,7 @@ func pomFetchWorker() {
 }
 
 // -------------------------------------------------------------------------------------
-// STEP 1: FIND AND PARSE build.gradle FILES
+// STEP 1: FIND & PARSE build.gradle FILES
 // -------------------------------------------------------------------------------------
 
 func findBuildGradleFiles(root string) ([]string, error) {
@@ -199,8 +195,8 @@ func findBuildGradleFiles(root string) ([]string, error) {
 func parseVariables(content string) map[string]string {
 	varMap := make(map[string]string)
 	re := regexp.MustCompile(`(?m)^\s*def\s+(\w+)\s*=\s*["']([^"']+)["']`)
-	all := re.FindAllStringSubmatch(content, -1)
-	for _, match := range all {
+	matches := re.FindAllStringSubmatch(content, -1)
+	for _, match := range matches {
 		varMap[match[1]] = match[2]
 	}
 	return varMap
@@ -216,8 +212,8 @@ func parseBuildGradleFile(filePath string) (map[string]ExtendedDepInfo, error) {
 	deps := make(map[string]ExtendedDepInfo)
 
 	re := regexp.MustCompile(`(?m)^\s*(implementation|api|compileOnly|runtimeOnly|testImplementation|androidTestImplementation|classpath)\s+['"]([^'"]+)['"]`)
-	all := re.FindAllStringSubmatch(content, -1)
-	for _, m := range all {
+	matches := re.FindAllStringSubmatch(content, -1)
+	for _, m := range matches {
 		depStr := m[2]
 		parts := strings.Split(depStr, ":")
 		if len(parts) < 2 {
@@ -900,10 +896,1807 @@ func generateHTMLReport(sections []GradleReportSection) error {
 }
 
 // -------------------------------------------------------------------------------------
+// ADDITIONAL: PRINT PROGRESS REPORT TO CONSOLE
+// -------------------------------------------------------------------------------------
+
+func printConsoleReport(sections []GradleReportSection) {
+	fmt.Println("----- Console Dependency Report -----")
+	for _, sec := range sections {
+		fmt.Printf("File: %s\n", sec.FilePath)
+		fmt.Printf("Direct Dependencies: %d, Transitive: %d\n", len(sec.Dependencies), sec.TransitiveCount)
+		fmt.Println("Flat Dependencies:")
+		var keys []string
+		for k := range sec.Dependencies {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			info := sec.Dependencies[k]
+			fmt.Printf("  %s -> %s (Parent: %s)\n", k, info.Display, info.Parent)
+		}
+		fmt.Println("Dependency Tree:")
+		for _, node := range sec.DependencyTree {
+			printTreeNode(node, 0)
+		}
+		fmt.Println("-------------------------------------")
+	}
+}
+
+func printTreeNode(node *GradleDependencyNode, indent int) {
+	prefix := strings.Repeat("  ", indent)
+	fmt.Printf("%s%s@%s (License: %s)\n", prefix, node.Name, node.Version, node.License)
+	for _, child := range node.Transitive {
+		printTreeNode(child, indent+1)
+	}
+}
+
+// -------------------------------------------------------------------------------------
+// STEP 4: CONCURRENT POM FETCH & DISK CACHING
+// -------------------------------------------------------------------------------------
+
+func concurrentFetchPOM(g, a, v string) (*MavenPOM, error) {
+	if g == "" || a == "" || v == "" {
+		return nil, fmt.Errorf("invalid GAV: %s:%s:%s", g, a, v)
+	}
+	key := fmt.Sprintf("%s:%s:%s", g, a, v)
+	if c, ok := pomCache.Load(key); ok {
+		return c.(*MavenPOM), nil
+	}
+	resultChan := make(chan fetchResult, 1)
+	pomRequests <- fetchRequest{
+		GroupID:    g,
+		ArtifactID: a,
+		Version:    v,
+		ResultChan: resultChan,
+	}
+	res := <-resultChan
+	if res.Err != nil {
+		fmt.Printf("⚠️ Error fetching POM for %s:%s:%s: %v\n", g, a, v, res.Err)
+		return nil, nil
+	}
+	if res.POM == nil {
+		fmt.Printf("⚠️ No POM found for %s:%s:%s\n", g, a, v)
+		return nil, nil
+	}
+	pomCache.Store(key, res.POM)
+	return res.POM, nil
+}
+
+func retrieveOrLoadPOM(g, a, v string) (*MavenPOM, error) {
+	key := fmt.Sprintf("%s:%s:%s", g, a, v)
+	if c, ok := pomCache.Load(key); ok {
+		return c.(*MavenPOM), nil
+	}
+	pom, err := loadPOMFromDisk(g, a, v)
+	if err == nil && pom != nil {
+		pomCache.Store(key, pom)
+	} else {
+		pom, err = fetchRemotePOM(g, a, v)
+		if err != nil {
+			return nil, err
+		}
+		_ = savePOMToDisk(g, a, v, pom)
+		pomCache.Store(key, pom)
+	}
+	if pom == nil {
+		return nil, fmt.Errorf("no POM for %s", key)
+	}
+	if pom.GroupID == "" {
+		pom.GroupID = pom.Parent.GroupID
+	}
+	if pom.Version == "" {
+		pom.Version = pom.Parent.Version
+	}
+	err = loadAllParents(pom, 0)
+	if err != nil {
+		fmt.Printf("⚠️ Parent loading issue for %s:%s:%s: %v\n", g, a, v, err)
+	}
+	return pom, nil
+}
+
+func loadAllParents(p *MavenPOM, depth int) error {
+	if depth > maxParentDepth {
+		return fmt.Errorf("parent POM recursion depth exceeded limit (%d)", maxParentDepth)
+	}
+	if p.Parent.GroupID == "" || p.Parent.ArtifactID == "" || p.Parent.Version == "" {
+		return nil
+	}
+	pkey := fmt.Sprintf("%s:%s:%s", p.Parent.GroupID, p.Parent.ArtifactID, p.Parent.Version)
+	if _, visited := parentVisit.Load(pkey); visited {
+		return fmt.Errorf("detected parent cycle: %s", pkey)
+	}
+	parentVisit.Store(pkey, true)
+	parentPOM, err := retrieveOrLoadPOM(p.Parent.GroupID, p.Parent.ArtifactID, p.Parent.Version)
+	if err != nil {
+		return err
+	}
+	p.DependencyMgmt.Dependencies = mergeDepMgmt(parentPOM.DependencyMgmt.Dependencies, p.DependencyMgmt.Dependencies)
+	if p.GroupID == "" {
+		p.GroupID = parentPOM.GroupID
+	}
+	if p.Version == "" {
+		p.Version = parentPOM.Version
+	}
+	return loadAllParents(parentPOM, depth+1)
+}
+
+func fetchRemotePOM(g, a, v string) (*MavenPOM, error) {
+	groupPath := strings.ReplaceAll(g, ".", "/")
+	urlCentral := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
+	urlGoogle := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
+
+	if pm, err := fetchPOMFromURL(urlCentral); err == nil {
+		return pm, nil
+	}
+	if pm, err := fetchPOMFromURL(urlGoogle); err == nil {
+		return pm, nil
+	}
+	return nil, fmt.Errorf("could not fetch remote POM for %s:%s:%s", g, a, v)
+}
+
+func fetchPOMFromURL(url string) (*MavenPOM, error) {
+	client := http.Client{Timeout: fetchTimeout}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var pom MavenPOM
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	dec.Strict = false
+	if err := dec.Decode(&pom); err != nil {
+		return nil, err
+	}
+	return &pom, nil
+}
+
+func mergeDepMgmt(parent, child []POMDep) []POMDep {
+	outMap := make(map[string]POMDep)
+	for _, d := range parent {
+		key := d.GroupID + ":" + d.ArtifactID
+		outMap[key] = d
+	}
+	for _, d := range child {
+		key := d.GroupID + ":" + d.ArtifactID
+		outMap[key] = d
+	}
+	var merged []POMDep
+	for _, val := range outMap {
+		merged = append(merged, val)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		return merged[i].GroupID < merged[j].GroupID
+	})
+	return merged
+}
+
+func loadPOMFromDisk(g, a, v string) (*MavenPOM, error) {
+	path := localCachePath(g, a, v)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var pom MavenPOM
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	dec.Strict = false
+	if err := dec.Decode(&pom); err != nil {
+		return nil, err
+	}
+	return &pom, nil
+}
+
+func savePOMToDisk(g, a, v string, pom *MavenPOM) error {
+	path := localCachePath(g, a, v)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	out, err := xml.MarshalIndent(pom, "", "  ")
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(out)
+	return err
+}
+
+func localCachePath(g, a, v string) string {
+	groupPath := strings.ReplaceAll(g, ".", "/")
+	return filepath.Join(localPOMCacheDir, groupPath, a, v, fmt.Sprintf("%s-%s.pom.xml", a, v))
+}
+
+// -------------------------------------------------------------------------------------
+// STEP 5: HTML REPORT GENERATION
+// -------------------------------------------------------------------------------------
+
+func buildGradleTreeHTML(node *GradleDependencyNode, level int) string {
+	class := "non-copyleft"
+	if node.License == "Unknown" {
+		class = "unknown-license"
+	} else if node.Copyleft {
+		class = "copyleft"
+	}
+	summary := fmt.Sprintf("%s@%s (License: %s)", node.Name, node.Version, node.License)
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf(`<details class="%s" style="margin-left:%dem;">`, class, level))
+	sb.WriteString(fmt.Sprintf(`<summary>%s</summary>`, template.HTMLEscapeString(summary)))
+	for _, c := range node.Transitive {
+		sb.WriteString(buildGradleTreeHTML(c, level+1))
+	}
+	sb.WriteString("</details>")
+	return sb.String()
+}
+
+func buildGradleTreesHTML(nodes []*GradleDependencyNode) template.HTML {
+	var buf strings.Builder
+	for _, n := range nodes {
+		buf.WriteString(buildGradleTreeHTML(n, 0))
+	}
+	return template.HTML(buf.String())
+}
+
+func getLicenseInfoWrapper(dep, version string) LicenseData {
+	parts := strings.Split(dep, "/")
+	if len(parts) != 2 {
+		return LicenseData{LicenseName: "Unknown"}
+	}
+	g, a := parts[0], parts[1]
+	pom, err := concurrentFetchPOM(g, a, version)
+	if err != nil || pom == nil {
+		return LicenseData{
+			LicenseName: "Unknown",
+			ProjectURL:  fmt.Sprintf("https://www.google.com/search?q=%s+%s+%s+license", g, a, version),
+		}
+	}
+	licenseName := detectLicense(pom)
+	groupPath := strings.ReplaceAll(g, ".", "/")
+	projURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/", groupPath, a, version)
+	pomURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, version, a, version)
+	return LicenseData{
+		LicenseName: licenseName,
+		ProjectURL:  projURL,
+		PomURL:      pomURL,
+	}
+}
+
+func generateHTMLReport(sections []GradleReportSection) error {
+	outDir := "./license-checker"
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return err
+	}
+	const tmplText = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Gradle Dependency License Report</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    h1 { color: #2c3e50; }
+    h2 { margin-top: 40px; }
+    table { width: 100%; border-collapse: collapse; margin-bottom: 40px; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    th { background-color: #f2f2f2; }
+    tr:nth-child(even) { background-color: #f9f9f9; }
+    a { color: #3498db; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    tr.copyleft { background-color: #ffdddd; }
+    tr.non-copyleft { background-color: #ddffdd; }
+    tr.unknown-license { background-color: #ffffdd; }
+
+    details.copyleft > summary {
+      background-color: #ffdddd;
+      padding: 2px 4px;
+      border-radius: 4px;
+    }
+    details.unknown-license > summary {
+      background-color: #ffffdd;
+      padding: 2px 4px;
+      border-radius: 4px;
+    }
+    details.non-copyleft > summary {
+      background-color: #ddffdd;
+      padding: 2px 4px;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Gradle Dependency License Report</h1>
+  <p>This report includes both a flat table and an expandable dependency tree.</p>
+
+  {{ range . }}
+    <h2>File: {{ .FilePath }}</h2>
+    <p>Total Dependencies Found: {{ len .Dependencies }}</p>
+
+    <h3>Dependencies Table</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Dependency</th>
+          <th>Version</th>
+          <th>License</th>
+          <th>Parent</th>
+          <th>Project Details</th>
+          <th>POM File</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{ range $dep, $info := .Dependencies }}
+          {{ $licData := getLicenseInfoWrapper $dep $info.Lookup }}
+          {{ if eq $licData.LicenseName "Unknown" }}
+            <tr class="unknown-license">
+          {{ else if isCopyleft $licData.LicenseName }}
+            <tr class="copyleft">
+          {{ else }}
+            <tr class="non-copyleft">
+          {{ end }}
+            <td>{{ $dep }}</td>
+            <td>{{ $info.Display }}</td>
+            <td>{{ $licData.LicenseName }}</td>
+            <td>{{ $info.Parent }}</td>
+            {{ if $licData.ProjectURL }}
+              <td><a href="{{ $licData.ProjectURL }}" target="_blank">View Details</a></td>
+            {{ else }}
+              <td></td>
+            {{ end }}
+            {{ if $licData.PomURL }}
+              <td><a href="{{ $licData.PomURL }}" target="_blank">View POM</a></td>
+            {{ else }}
+              <td></td>
+            {{ end }}
+          </tr>
+        {{ end }}
+      </tbody>
+    </table>
+
+    <h3>Dependency Tree</h3>
+    {{ buildGradleTreesHTML .DependencyTree }}
+  {{ end }}
+</body>
+</html>
+`
+	tmpl, err := template.New("report").Funcs(template.FuncMap{
+		"buildGradleTreesHTML":  buildGradleTreesHTML,
+		"getLicenseInfoWrapper": getLicenseInfoWrapper,
+		"isCopyleft":            isCopyleft,
+	}).Parse(tmplText)
+	if err != nil {
+		return err
+	}
+
+	outputFile := filepath.Join(outDir, "dependency-license-report.html")
+	f, err := os.Create(outputFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if err := tmpl.Execute(f, sections); err != nil {
+		return err
+	}
+
+	fmt.Printf("✅ License report generated at %s\n", outputFile)
+	return nil
+}
+
+// -------------------------------------------------------------------------------------
+// ADDITIONAL: PRINT PROGRESS REPORT TO CONSOLE
+// -------------------------------------------------------------------------------------
+
+func printConsoleReport(sections []GradleReportSection) {
+	fmt.Println("----- Console Dependency Report -----")
+	for _, sec := range sections {
+		fmt.Printf("File: %s\n", sec.FilePath)
+		fmt.Printf("Direct Dependencies: %d, Transitive: %d\n", len(sec.Dependencies), sec.TransitiveCount)
+		fmt.Println("Flat Dependencies:")
+		var keys []string
+		for k := range sec.Dependencies {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			info := sec.Dependencies[k]
+			fmt.Printf("  %s -> %s (Parent: %s)\n", k, info.Display, info.Parent)
+		}
+		fmt.Println("Dependency Tree:")
+		for _, node := range sec.DependencyTree {
+			printTreeNode(node, 0)
+		}
+		fmt.Println("-------------------------------------")
+	}
+}
+
+func printTreeNode(node *GradleDependencyNode, indent int) {
+	prefix := strings.Repeat("  ", indent)
+	fmt.Printf("%s%s@%s (License: %s)\n", prefix, node.Name, node.Version, node.License)
+	for _, child := range node.Transitive {
+		printTreeNode(child, indent+1)
+	}
+}
+
+// -------------------------------------------------------------------------------------
+// STEP 4: CONCURRENT POM FETCH & DISK CACHING
+// -------------------------------------------------------------------------------------
+
+func concurrentFetchPOM(g, a, v string) (*MavenPOM, error) {
+	if g == "" || a == "" || v == "" {
+		return nil, fmt.Errorf("invalid GAV: %s:%s:%s", g, a, v)
+	}
+	key := fmt.Sprintf("%s:%s:%s", g, a, v)
+	if c, ok := pomCache.Load(key); ok {
+		return c.(*MavenPOM), nil
+	}
+	resultChan := make(chan fetchResult, 1)
+	pomRequests <- fetchRequest{
+		GroupID:    g,
+		ArtifactID: a,
+		Version:    v,
+		ResultChan: resultChan,
+	}
+	res := <-resultChan
+	if res.Err != nil {
+		fmt.Printf("⚠️ Error fetching POM for %s:%s:%s: %v\n", g, a, v, res.Err)
+		return nil, nil
+	}
+	if res.POM == nil {
+		fmt.Printf("⚠️ No POM found for %s:%s:%s\n", g, a, v)
+		return nil, nil
+	}
+	pomCache.Store(key, res.POM)
+	return res.POM, nil
+}
+
+func retrieveOrLoadPOM(g, a, v string) (*MavenPOM, error) {
+	key := fmt.Sprintf("%s:%s:%s", g, a, v)
+	if c, ok := pomCache.Load(key); ok {
+		return c.(*MavenPOM), nil
+	}
+	pom, err := loadPOMFromDisk(g, a, v)
+	if err == nil && pom != nil {
+		pomCache.Store(key, pom)
+	} else {
+		pom, err = fetchRemotePOM(g, a, v)
+		if err != nil {
+			return nil, err
+		}
+		_ = savePOMToDisk(g, a, v, pom)
+		pomCache.Store(key, pom)
+	}
+	if pom == nil {
+		return nil, fmt.Errorf("no POM for %s", key)
+	}
+	if pom.GroupID == "" {
+		pom.GroupID = pom.Parent.GroupID
+	}
+	if pom.Version == "" {
+		pom.Version = pom.Parent.Version
+	}
+	err = loadAllParents(pom, 0)
+	if err != nil {
+		fmt.Printf("⚠️ Parent loading issue for %s:%s:%s: %v\n", g, a, v, err)
+	}
+	return pom, nil
+}
+
+func loadAllParents(p *MavenPOM, depth int) error {
+	if depth > maxParentDepth {
+		return fmt.Errorf("parent POM recursion depth exceeded limit (%d)", maxParentDepth)
+	}
+	if p.Parent.GroupID == "" || p.Parent.ArtifactID == "" || p.Parent.Version == "" {
+		return nil
+	}
+	pkey := fmt.Sprintf("%s:%s:%s", p.Parent.GroupID, p.Parent.ArtifactID, p.Parent.Version)
+	if _, visited := parentVisit.Load(pkey); visited {
+		return fmt.Errorf("detected parent cycle: %s", pkey)
+	}
+	parentVisit.Store(pkey, true)
+	parentPOM, err := retrieveOrLoadPOM(p.Parent.GroupID, p.Parent.ArtifactID, p.Parent.Version)
+	if err != nil {
+		return err
+	}
+	p.DependencyMgmt.Dependencies = mergeDepMgmt(parentPOM.DependencyMgmt.Dependencies, p.DependencyMgmt.Dependencies)
+	if p.GroupID == "" {
+		p.GroupID = parentPOM.GroupID
+	}
+	if p.Version == "" {
+		p.Version = parentPOM.Version
+	}
+	return loadAllParents(parentPOM, depth+1)
+}
+
+func fetchRemotePOM(g, a, v string) (*MavenPOM, error) {
+	groupPath := strings.ReplaceAll(g, ".", "/")
+	urlCentral := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
+	urlGoogle := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
+
+	if pm, err := fetchPOMFromURL(urlCentral); err == nil {
+		return pm, nil
+	}
+	if pm, err := fetchPOMFromURL(urlGoogle); err == nil {
+		return pm, nil
+	}
+	return nil, fmt.Errorf("could not fetch remote POM for %s:%s:%s", g, a, v)
+}
+
+func fetchPOMFromURL(url string) (*MavenPOM, error) {
+	client := http.Client{Timeout: fetchTimeout}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var pom MavenPOM
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	dec.Strict = false
+	if err := dec.Decode(&pom); err != nil {
+		return nil, err
+	}
+	return &pom, nil
+}
+
+func mergeDepMgmt(parent, child []POMDep) []POMDep {
+	outMap := make(map[string]POMDep)
+	for _, d := range parent {
+		key := d.GroupID + ":" + d.ArtifactID
+		outMap[key] = d
+	}
+	for _, d := range child {
+		key := d.GroupID + ":" + d.ArtifactID
+		outMap[key] = d
+	}
+	var merged []POMDep
+	for _, val := range outMap {
+		merged = append(merged, val)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		return merged[i].GroupID < merged[j].GroupID
+	})
+	return merged
+}
+
+func loadPOMFromDisk(g, a, v string) (*MavenPOM, error) {
+	path := localCachePath(g, a, v)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var pom MavenPOM
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	dec.Strict = false
+	if err := dec.Decode(&pom); err != nil {
+		return nil, err
+	}
+	return &pom, nil
+}
+
+func savePOMToDisk(g, a, v string, pom *MavenPOM) error {
+	path := localCachePath(g, a, v)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	out, err := xml.MarshalIndent(pom, "", "  ")
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(out)
+	return err
+}
+
+func localCachePath(g, a, v string) string {
+	groupPath := strings.ReplaceAll(g, ".", "/")
+	return filepath.Join(localPOMCacheDir, groupPath, a, v, fmt.Sprintf("%s-%s.pom.xml", a, v))
+}
+
+// -------------------------------------------------------------------------------------
+// STEP 5: HTML REPORT GENERATION
+// -------------------------------------------------------------------------------------
+
+func buildGradleTreeHTML(node *GradleDependencyNode, level int) string {
+	class := "non-copyleft"
+	if node.License == "Unknown" {
+		class = "unknown-license"
+	} else if node.Copyleft {
+		class = "copyleft"
+	}
+	summary := fmt.Sprintf("%s@%s (License: %s)", node.Name, node.Version, node.License)
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf(`<details class="%s" style="margin-left:%dem;">`, class, level))
+	sb.WriteString(fmt.Sprintf(`<summary>%s</summary>`, template.HTMLEscapeString(summary)))
+	for _, c := range node.Transitive {
+		sb.WriteString(buildGradleTreeHTML(c, level+1))
+	}
+	sb.WriteString("</details>")
+	return sb.String()
+}
+
+func buildGradleTreesHTML(nodes []*GradleDependencyNode) template.HTML {
+	var buf strings.Builder
+	for _, n := range nodes {
+		buf.WriteString(buildGradleTreeHTML(n, 0))
+	}
+	return template.HTML(buf.String())
+}
+
+func getLicenseInfoWrapper(dep, version string) LicenseData {
+	parts := strings.Split(dep, "/")
+	if len(parts) != 2 {
+		return LicenseData{LicenseName: "Unknown"}
+	}
+	g, a := parts[0], parts[1]
+	pom, err := concurrentFetchPOM(g, a, version)
+	if err != nil || pom == nil {
+		return LicenseData{
+			LicenseName: "Unknown",
+			ProjectURL:  fmt.Sprintf("https://www.google.com/search?q=%s+%s+%s+license", g, a, version),
+		}
+	}
+	licenseName := detectLicense(pom)
+	groupPath := strings.ReplaceAll(g, ".", "/")
+	projURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/", groupPath, a, version)
+	pomURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, version, a, version)
+	return LicenseData{
+		LicenseName: licenseName,
+		ProjectURL:  projURL,
+		PomURL:      pomURL,
+	}
+}
+
+func generateHTMLReport(sections []GradleReportSection) error {
+	outDir := "./license-checker"
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return err
+	}
+	const tmplText = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Gradle Dependency License Report</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    h1 { color: #2c3e50; }
+    h2 { margin-top: 40px; }
+    table { width: 100%; border-collapse: collapse; margin-bottom: 40px; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    th { background-color: #f2f2f2; }
+    tr:nth-child(even) { background-color: #f9f9f9; }
+    a { color: #3498db; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    tr.copyleft { background-color: #ffdddd; }
+    tr.non-copyleft { background-color: #ddffdd; }
+    tr.unknown-license { background-color: #ffffdd; }
+
+    details.copyleft > summary {
+      background-color: #ffdddd;
+      padding: 2px 4px;
+      border-radius: 4px;
+    }
+    details.unknown-license > summary {
+      background-color: #ffffdd;
+      padding: 2px 4px;
+      border-radius: 4px;
+    }
+    details.non-copyleft > summary {
+      background-color: #ddffdd;
+      padding: 2px 4px;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Gradle Dependency License Report</h1>
+  <p>This report includes both a flat table and an expandable dependency tree.</p>
+
+  {{ range . }}
+    <h2>File: {{ .FilePath }}</h2>
+    <p>Total Dependencies Found: {{ len .Dependencies }}</p>
+
+    <h3>Dependencies Table</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Dependency</th>
+          <th>Version</th>
+          <th>License</th>
+          <th>Parent</th>
+          <th>Project Details</th>
+          <th>POM File</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{ range $dep, $info := .Dependencies }}
+          {{ $licData := getLicenseInfoWrapper $dep $info.Lookup }}
+          {{ if eq $licData.LicenseName "Unknown" }}
+            <tr class="unknown-license">
+          {{ else if isCopyleft $licData.LicenseName }}
+            <tr class="copyleft">
+          {{ else }}
+            <tr class="non-copyleft">
+          {{ end }}
+            <td>{{ $dep }}</td>
+            <td>{{ $info.Display }}</td>
+            <td>{{ $licData.LicenseName }}</td>
+            <td>{{ $info.Parent }}</td>
+            {{ if $licData.ProjectURL }}
+              <td><a href="{{ $licData.ProjectURL }}" target="_blank">View Details</a></td>
+            {{ else }}
+              <td></td>
+            {{ end }}
+            {{ if $licData.PomURL }}
+              <td><a href="{{ $licData.PomURL }}" target="_blank">View POM</a></td>
+            {{ else }}
+              <td></td>
+            {{ end }}
+          </tr>
+        {{ end }}
+      </tbody>
+    </table>
+
+    <h3>Dependency Tree</h3>
+    {{ buildGradleTreesHTML .DependencyTree }}
+  {{ end }}
+</body>
+</html>
+`
+	tmpl, err := template.New("report").Funcs(template.FuncMap{
+		"buildGradleTreesHTML":  buildGradleTreesHTML,
+		"getLicenseInfoWrapper": getLicenseInfoWrapper,
+		"isCopyleft":            isCopyleft,
+	}).Parse(tmplText)
+	if err != nil {
+		return err
+	}
+
+	outputFile := filepath.Join(outDir, "dependency-license-report.html")
+	f, err := os.Create(outputFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if err := tmpl.Execute(f, sections); err != nil {
+		return err
+	}
+
+	fmt.Printf("✅ License report generated at %s\n", outputFile)
+	return nil
+}
+
+// -------------------------------------------------------------------------------------
+// ADDITIONAL: PRINT PROGRESS REPORT TO CONSOLE
+// -------------------------------------------------------------------------------------
+
+func printConsoleReport(sections []GradleReportSection) {
+	fmt.Println("----- Console Dependency Report -----")
+	for _, sec := range sections {
+		fmt.Printf("File: %s\n", sec.FilePath)
+		fmt.Printf("Direct Dependencies: %d, Transitive: %d\n", len(sec.Dependencies), sec.TransitiveCount)
+		fmt.Println("Flat Dependencies:")
+		var keys []string
+		for k := range sec.Dependencies {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			info := sec.Dependencies[k]
+			fmt.Printf("  %s -> %s (Parent: %s)\n", k, info.Display, info.Parent)
+		}
+		fmt.Println("Dependency Tree:")
+		for _, node := range sec.DependencyTree {
+			printTreeNode(node, 0)
+		}
+		fmt.Println("-------------------------------------")
+	}
+}
+
+func printTreeNode(node *GradleDependencyNode, indent int) {
+	prefix := strings.Repeat("  ", indent)
+	fmt.Printf("%s%s@%s (License: %s)\n", prefix, node.Name, node.Version, node.License)
+	for _, child := range node.Transitive {
+		printTreeNode(child, indent+1)
+	}
+}
+
+// -------------------------------------------------------------------------------------
+// STEP 4: CONCURRENT POM FETCH & DISK CACHING
+// -------------------------------------------------------------------------------------
+
+func concurrentFetchPOM(g, a, v string) (*MavenPOM, error) {
+	if g == "" || a == "" || v == "" {
+		return nil, fmt.Errorf("invalid GAV: %s:%s:%s", g, a, v)
+	}
+	key := fmt.Sprintf("%s:%s:%s", g, a, v)
+	if c, ok := pomCache.Load(key); ok {
+		return c.(*MavenPOM), nil
+	}
+	resultChan := make(chan fetchResult, 1)
+	pomRequests <- fetchRequest{
+		GroupID:    g,
+		ArtifactID: a,
+		Version:    v,
+		ResultChan: resultChan,
+	}
+	res := <-resultChan
+	if res.Err != nil {
+		fmt.Printf("⚠️ Error fetching POM for %s:%s:%s: %v\n", g, a, v, res.Err)
+		return nil, nil
+	}
+	if res.POM == nil {
+		fmt.Printf("⚠️ No POM found for %s:%s:%s\n", g, a, v)
+		return nil, nil
+	}
+	pomCache.Store(key, res.POM)
+	return res.POM, nil
+}
+
+func retrieveOrLoadPOM(g, a, v string) (*MavenPOM, error) {
+	key := fmt.Sprintf("%s:%s:%s", g, a, v)
+	if c, ok := pomCache.Load(key); ok {
+		return c.(*MavenPOM), nil
+	}
+	pom, err := loadPOMFromDisk(g, a, v)
+	if err == nil && pom != nil {
+		pomCache.Store(key, pom)
+	} else {
+		pom, err = fetchRemotePOM(g, a, v)
+		if err != nil {
+			return nil, err
+		}
+		_ = savePOMToDisk(g, a, v, pom)
+		pomCache.Store(key, pom)
+	}
+	if pom == nil {
+		return nil, fmt.Errorf("no POM for %s", key)
+	}
+	if pom.GroupID == "" {
+		pom.GroupID = pom.Parent.GroupID
+	}
+	if pom.Version == "" {
+		pom.Version = pom.Parent.Version
+	}
+	err = loadAllParents(pom, 0)
+	if err != nil {
+		fmt.Printf("⚠️ Parent loading issue for %s:%s:%s: %v\n", g, a, v, err)
+	}
+	return pom, nil
+}
+
+func loadAllParents(p *MavenPOM, depth int) error {
+	if depth > maxParentDepth {
+		return fmt.Errorf("parent POM recursion depth exceeded limit (%d)", maxParentDepth)
+	}
+	if p.Parent.GroupID == "" || p.Parent.ArtifactID == "" || p.Parent.Version == "" {
+		return nil
+	}
+	pkey := fmt.Sprintf("%s:%s:%s", p.Parent.GroupID, p.Parent.ArtifactID, p.Parent.Version)
+	if _, visited := parentVisit.Load(pkey); visited {
+		return fmt.Errorf("detected parent cycle: %s", pkey)
+	}
+	parentVisit.Store(pkey, true)
+	parentPOM, err := retrieveOrLoadPOM(p.Parent.GroupID, p.Parent.ArtifactID, p.Parent.Version)
+	if err != nil {
+		return err
+	}
+	p.DependencyMgmt.Dependencies = mergeDepMgmt(parentPOM.DependencyMgmt.Dependencies, p.DependencyMgmt.Dependencies)
+	if p.GroupID == "" {
+		p.GroupID = parentPOM.GroupID
+	}
+	if p.Version == "" {
+		p.Version = parentPOM.Version
+	}
+	return loadAllParents(parentPOM, depth+1)
+}
+
+func fetchRemotePOM(g, a, v string) (*MavenPOM, error) {
+	groupPath := strings.ReplaceAll(g, ".", "/")
+	urlCentral := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
+	urlGoogle := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
+
+	if pm, err := fetchPOMFromURL(urlCentral); err == nil {
+		return pm, nil
+	}
+	if pm, err := fetchPOMFromURL(urlGoogle); err == nil {
+		return pm, nil
+	}
+	return nil, fmt.Errorf("could not fetch remote POM for %s:%s:%s", g, a, v)
+}
+
+func fetchPOMFromURL(url string) (*MavenPOM, error) {
+	client := http.Client{Timeout: fetchTimeout}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var pom MavenPOM
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	dec.Strict = false
+	if err := dec.Decode(&pom); err != nil {
+		return nil, err
+	}
+	return &pom, nil
+}
+
+func mergeDepMgmt(parent, child []POMDep) []POMDep {
+	outMap := make(map[string]POMDep)
+	for _, d := range parent {
+		key := d.GroupID + ":" + d.ArtifactID
+		outMap[key] = d
+	}
+	for _, d := range child {
+		key := d.GroupID + ":" + d.ArtifactID
+		outMap[key] = d
+	}
+	var merged []POMDep
+	for _, val := range outMap {
+		merged = append(merged, val)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		return merged[i].GroupID < merged[j].GroupID
+	})
+	return merged
+}
+
+func loadPOMFromDisk(g, a, v string) (*MavenPOM, error) {
+	path := localCachePath(g, a, v)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var pom MavenPOM
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	dec.Strict = false
+	if err := dec.Decode(&pom); err != nil {
+		return nil, err
+	}
+	return &pom, nil
+}
+
+func savePOMToDisk(g, a, v string, pom *MavenPOM) error {
+	path := localCachePath(g, a, v)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	out, err := xml.MarshalIndent(pom, "", "  ")
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(out)
+	return err
+}
+
+func localCachePath(g, a, v string) string {
+	groupPath := strings.ReplaceAll(g, ".", "/")
+	return filepath.Join(localPOMCacheDir, groupPath, a, v, fmt.Sprintf("%s-%s.pom.xml", a, v))
+}
+
+// -------------------------------------------------------------------------------------
+// STEP 5: HTML REPORT GENERATION
+// -------------------------------------------------------------------------------------
+
+func buildGradleTreeHTML(node *GradleDependencyNode, level int) string {
+	class := "non-copyleft"
+	if node.License == "Unknown" {
+		class = "unknown-license"
+	} else if node.Copyleft {
+		class = "copyleft"
+	}
+	summary := fmt.Sprintf("%s@%s (License: %s)", node.Name, node.Version, node.License)
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf(`<details class="%s" style="margin-left:%dem;">`, class, level))
+	sb.WriteString(fmt.Sprintf(`<summary>%s</summary>`, template.HTMLEscapeString(summary)))
+	for _, c := range node.Transitive {
+		sb.WriteString(buildGradleTreeHTML(c, level+1))
+	}
+	sb.WriteString("</details>")
+	return sb.String()
+}
+
+func buildGradleTreesHTML(nodes []*GradleDependencyNode) template.HTML {
+	var buf strings.Builder
+	for _, n := range nodes {
+		buf.WriteString(buildGradleTreeHTML(n, 0))
+	}
+	return template.HTML(buf.String())
+}
+
+func getLicenseInfoWrapper(dep, version string) LicenseData {
+	parts := strings.Split(dep, "/")
+	if len(parts) != 2 {
+		return LicenseData{LicenseName: "Unknown"}
+	}
+	g, a := parts[0], parts[1]
+	pom, err := concurrentFetchPOM(g, a, version)
+	if err != nil || pom == nil {
+		return LicenseData{
+			LicenseName: "Unknown",
+			ProjectURL:  fmt.Sprintf("https://www.google.com/search?q=%s+%s+%s+license", g, a, version),
+		}
+	}
+	licenseName := detectLicense(pom)
+	groupPath := strings.ReplaceAll(g, ".", "/")
+	projURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/", groupPath, a, version)
+	pomURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, version, a, version)
+	return LicenseData{
+		LicenseName: licenseName,
+		ProjectURL:  projURL,
+		PomURL:      pomURL,
+	}
+}
+
+func generateHTMLReport(sections []GradleReportSection) error {
+	outDir := "./license-checker"
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return err
+	}
+	const tmplText = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Gradle Dependency License Report</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    h1 { color: #2c3e50; }
+    h2 { margin-top: 40px; }
+    table { width: 100%; border-collapse: collapse; margin-bottom: 40px; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    th { background-color: #f2f2f2; }
+    tr:nth-child(even) { background-color: #f9f9f9; }
+    a { color: #3498db; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    tr.copyleft { background-color: #ffdddd; }
+    tr.non-copyleft { background-color: #ddffdd; }
+    tr.unknown-license { background-color: #ffffdd; }
+
+    details.copyleft > summary {
+      background-color: #ffdddd;
+      padding: 2px 4px;
+      border-radius: 4px;
+    }
+    details.unknown-license > summary {
+      background-color: #ffffdd;
+      padding: 2px 4px;
+      border-radius: 4px;
+    }
+    details.non-copyleft > summary {
+      background-color: #ddffdd;
+      padding: 2px 4px;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Gradle Dependency License Report</h1>
+  <p>This report includes both a flat table and an expandable dependency tree.</p>
+
+  {{ range . }}
+    <h2>File: {{ .FilePath }}</h2>
+    <p>Total Dependencies Found: {{ len .Dependencies }}</p>
+
+    <h3>Dependencies Table</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Dependency</th>
+          <th>Version</th>
+          <th>License</th>
+          <th>Parent</th>
+          <th>Project Details</th>
+          <th>POM File</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{ range $dep, $info := .Dependencies }}
+          {{ $licData := getLicenseInfoWrapper $dep $info.Lookup }}
+          {{ if eq $licData.LicenseName "Unknown" }}
+            <tr class="unknown-license">
+          {{ else if isCopyleft $licData.LicenseName }}
+            <tr class="copyleft">
+          {{ else }}
+            <tr class="non-copyleft">
+          {{ end }}
+            <td>{{ $dep }}</td>
+            <td>{{ $info.Display }}</td>
+            <td>{{ $licData.LicenseName }}</td>
+            <td>{{ $info.Parent }}</td>
+            {{ if $licData.ProjectURL }}
+              <td><a href="{{ $licData.ProjectURL }}" target="_blank">View Details</a></td>
+            {{ else }}
+              <td></td>
+            {{ end }}
+            {{ if $licData.PomURL }}
+              <td><a href="{{ $licData.PomURL }}" target="_blank">View POM</a></td>
+            {{ else }}
+              <td></td>
+            {{ end }}
+          </tr>
+        {{ end }}
+      </tbody>
+    </table>
+
+    <h3>Dependency Tree</h3>
+    {{ buildGradleTreesHTML .DependencyTree }}
+  {{ end }}
+</body>
+</html>
+`
+	tmpl, err := template.New("report").Funcs(template.FuncMap{
+		"buildGradleTreesHTML":  buildGradleTreesHTML,
+		"getLicenseInfoWrapper": getLicenseInfoWrapper,
+		"isCopyleft":            isCopyleft,
+	}).Parse(tmplText)
+	if err != nil {
+		return err
+	}
+
+	outputFile := filepath.Join(outDir, "dependency-license-report.html")
+	f, err := os.Create(outputFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if err := tmpl.Execute(f, sections); err != nil {
+		return err
+	}
+
+	fmt.Printf("✅ License report generated at %s\n", outputFile)
+	return nil
+}
+
+// -------------------------------------------------------------------------------------
+// ADDITIONAL: PRINT PROGRESS REPORT TO CONSOLE
+// -------------------------------------------------------------------------------------
+
+func printConsoleReport(sections []GradleReportSection) {
+	fmt.Println("----- Console Dependency Report -----")
+	for _, sec := range sections {
+		fmt.Printf("File: %s\n", sec.FilePath)
+		fmt.Printf("Direct Dependencies: %d, Transitive: %d\n", len(sec.Dependencies), sec.TransitiveCount)
+		fmt.Println("Flat Dependencies:")
+		var keys []string
+		for k := range sec.Dependencies {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			info := sec.Dependencies[k]
+			fmt.Printf("  %s -> %s (Parent: %s)\n", k, info.Display, info.Parent)
+		}
+		fmt.Println("Dependency Tree:")
+		for _, node := range sec.DependencyTree {
+			printTreeNode(node, 0)
+		}
+		fmt.Println("-------------------------------------")
+	}
+}
+
+func printTreeNode(node *GradleDependencyNode, indent int) {
+	prefix := strings.Repeat("  ", indent)
+	fmt.Printf("%s%s@%s (License: %s)\n", prefix, node.Name, node.Version, node.License)
+	for _, child := range node.Transitive {
+		printTreeNode(child, indent+1)
+	}
+}
+
+// -------------------------------------------------------------------------------------
+// STEP 4: CONCURRENT POM FETCH & DISK CACHING
+// -------------------------------------------------------------------------------------
+
+func concurrentFetchPOM(g, a, v string) (*MavenPOM, error) {
+	if g == "" || a == "" || v == "" {
+		return nil, fmt.Errorf("invalid GAV: %s:%s:%s", g, a, v)
+	}
+	key := fmt.Sprintf("%s:%s:%s", g, a, v)
+	if c, ok := pomCache.Load(key); ok {
+		return c.(*MavenPOM), nil
+	}
+	resultChan := make(chan fetchResult, 1)
+	pomRequests <- fetchRequest{
+		GroupID:    g,
+		ArtifactID: a,
+		Version:    v,
+		ResultChan: resultChan,
+	}
+	res := <-resultChan
+	if res.Err != nil {
+		fmt.Printf("⚠️ Error fetching POM for %s:%s:%s: %v\n", g, a, v, res.Err)
+		return nil, nil
+	}
+	if res.POM == nil {
+		fmt.Printf("⚠️ No POM found for %s:%s:%s\n", g, a, v)
+		return nil, nil
+	}
+	pomCache.Store(key, res.POM)
+	return res.POM, nil
+}
+
+func retrieveOrLoadPOM(g, a, v string) (*MavenPOM, error) {
+	key := fmt.Sprintf("%s:%s:%s", g, a, v)
+	if c, ok := pomCache.Load(key); ok {
+		return c.(*MavenPOM), nil
+	}
+	pom, err := loadPOMFromDisk(g, a, v)
+	if err == nil && pom != nil {
+		pomCache.Store(key, pom)
+	} else {
+		pom, err = fetchRemotePOM(g, a, v)
+		if err != nil {
+			return nil, err
+		}
+		_ = savePOMToDisk(g, a, v, pom)
+		pomCache.Store(key, pom)
+	}
+	if pom == nil {
+		return nil, fmt.Errorf("no POM for %s", key)
+	}
+	if pom.GroupID == "" {
+		pom.GroupID = pom.Parent.GroupID
+	}
+	if pom.Version == "" {
+		pom.Version = pom.Parent.Version
+	}
+	err = loadAllParents(pom, 0)
+	if err != nil {
+		fmt.Printf("⚠️ Parent loading issue for %s:%s:%s: %v\n", g, a, v, err)
+	}
+	return pom, nil
+}
+
+func loadAllParents(p *MavenPOM, depth int) error {
+	if depth > maxParentDepth {
+		return fmt.Errorf("parent POM recursion depth exceeded limit (%d)", maxParentDepth)
+	}
+	if p.Parent.GroupID == "" || p.Parent.ArtifactID == "" || p.Parent.Version == "" {
+		return nil
+	}
+	pkey := fmt.Sprintf("%s:%s:%s", p.Parent.GroupID, p.Parent.ArtifactID, p.Parent.Version)
+	if _, visited := parentVisit.Load(pkey); visited {
+		return fmt.Errorf("detected parent cycle: %s", pkey)
+	}
+	parentVisit.Store(pkey, true)
+	parentPOM, err := retrieveOrLoadPOM(p.Parent.GroupID, p.Parent.ArtifactID, p.Parent.Version)
+	if err != nil {
+		return err
+	}
+	p.DependencyMgmt.Dependencies = mergeDepMgmt(parentPOM.DependencyMgmt.Dependencies, p.DependencyMgmt.Dependencies)
+	if p.GroupID == "" {
+		p.GroupID = parentPOM.GroupID
+	}
+	if p.Version == "" {
+		p.Version = parentPOM.Version
+	}
+	return loadAllParents(parentPOM, depth+1)
+}
+
+func fetchRemotePOM(g, a, v string) (*MavenPOM, error) {
+	groupPath := strings.ReplaceAll(g, ".", "/")
+	urlCentral := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
+	urlGoogle := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
+
+	if pm, err := fetchPOMFromURL(urlCentral); err == nil {
+		return pm, nil
+	}
+	if pm, err := fetchPOMFromURL(urlGoogle); err == nil {
+		return pm, nil
+	}
+	return nil, fmt.Errorf("could not fetch remote POM for %s:%s:%s", g, a, v)
+}
+
+func fetchPOMFromURL(url string) (*MavenPOM, error) {
+	client := http.Client{Timeout: fetchTimeout}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var pom MavenPOM
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	dec.Strict = false
+	if err := dec.Decode(&pom); err != nil {
+		return nil, err
+	}
+	return &pom, nil
+}
+
+func mergeDepMgmt(parent, child []POMDep) []POMDep {
+	outMap := make(map[string]POMDep)
+	for _, d := range parent {
+		key := d.GroupID + ":" + d.ArtifactID
+		outMap[key] = d
+	}
+	for _, d := range child {
+		key := d.GroupID + ":" + d.ArtifactID
+		outMap[key] = d
+	}
+	var merged []POMDep
+	for _, val := range outMap {
+		merged = append(merged, val)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		return merged[i].GroupID < merged[j].GroupID
+	})
+	return merged
+}
+
+func loadPOMFromDisk(g, a, v string) (*MavenPOM, error) {
+	path := localCachePath(g, a, v)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var pom MavenPOM
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	dec.Strict = false
+	if err := dec.Decode(&pom); err != nil {
+		return nil, err
+	}
+	return &pom, nil
+}
+
+func savePOMToDisk(g, a, v string, pom *MavenPOM) error {
+	path := localCachePath(g, a, v)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	out, err := xml.MarshalIndent(pom, "", "  ")
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(out)
+	return err
+}
+
+func localCachePath(g, a, v string) string {
+	groupPath := strings.ReplaceAll(g, ".", "/")
+	return filepath.Join(localPOMCacheDir, groupPath, a, v, fmt.Sprintf("%s-%s.pom.xml", a, v))
+}
+
+// -------------------------------------------------------------------------------------
+// ADDITIONAL: PRINT PROGRESS REPORT TO CONSOLE
+// -------------------------------------------------------------------------------------
+
+func printConsoleReport(sections []GradleReportSection) {
+	fmt.Println("----- Console Dependency Report -----")
+	for _, sec := range sections {
+		fmt.Printf("File: %s\n", sec.FilePath)
+		fmt.Printf("Direct Dependencies: %d, Transitive: %d\n", len(sec.Dependencies), sec.TransitiveCount)
+		fmt.Println("Flat Dependencies:")
+		var keys []string
+		for k := range sec.Dependencies {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			info := sec.Dependencies[k]
+			fmt.Printf("  %s -> %s (Parent: %s)\n", k, info.Display, info.Parent)
+		}
+		fmt.Println("Dependency Tree:")
+		for _, node := range sec.DependencyTree {
+			printTreeNode(node, 0)
+		}
+		fmt.Println("-------------------------------------")
+	}
+}
+
+func printTreeNode(node *GradleDependencyNode, indent int) {
+	prefix := strings.Repeat("  ", indent)
+	fmt.Printf("%s%s@%s (License: %s)\n", prefix, node.Name, node.Version, node.License)
+	for _, child := range node.Transitive {
+		printTreeNode(child, indent+1)
+	}
+}
+
+// -------------------------------------------------------------------------------------
+// STEP 4: CONCURRENT POM FETCH & DISK CACHING
+// -------------------------------------------------------------------------------------
+
+func concurrentFetchPOM(g, a, v string) (*MavenPOM, error) {
+	if g == "" || a == "" || v == "" {
+		return nil, fmt.Errorf("invalid GAV: %s:%s:%s", g, a, v)
+	}
+	key := fmt.Sprintf("%s:%s:%s", g, a, v)
+	if c, ok := pomCache.Load(key); ok {
+		return c.(*MavenPOM), nil
+	}
+	resultChan := make(chan fetchResult, 1)
+	pomRequests <- fetchRequest{
+		GroupID:    g,
+		ArtifactID: a,
+		Version:    v,
+		ResultChan: resultChan,
+	}
+	res := <-resultChan
+	if res.Err != nil {
+		fmt.Printf("⚠️ Error fetching POM for %s:%s:%s: %v\n", g, a, v, res.Err)
+		return nil, nil
+	}
+	if res.POM == nil {
+		fmt.Printf("⚠️ No POM found for %s:%s:%s\n", g, a, v)
+		return nil, nil
+	}
+	pomCache.Store(key, res.POM)
+	return res.POM, nil
+}
+
+func retrieveOrLoadPOM(g, a, v string) (*MavenPOM, error) {
+	key := fmt.Sprintf("%s:%s:%s", g, a, v)
+	if c, ok := pomCache.Load(key); ok {
+		return c.(*MavenPOM), nil
+	}
+	pom, err := loadPOMFromDisk(g, a, v)
+	if err == nil && pom != nil {
+		pomCache.Store(key, pom)
+	} else {
+		pom, err = fetchRemotePOM(g, a, v)
+		if err != nil {
+			return nil, err
+		}
+		_ = savePOMToDisk(g, a, v, pom)
+		pomCache.Store(key, pom)
+	}
+	if pom == nil {
+		return nil, fmt.Errorf("no POM for %s", key)
+	}
+	if pom.GroupID == "" {
+		pom.GroupID = pom.Parent.GroupID
+	}
+	if pom.Version == "" {
+		pom.Version = pom.Parent.Version
+	}
+	err = loadAllParents(pom, 0)
+	if err != nil {
+		fmt.Printf("⚠️ Parent loading issue for %s:%s:%s: %v\n", g, a, v, err)
+	}
+	return pom, nil
+}
+
+func loadAllParents(p *MavenPOM, depth int) error {
+	if depth > maxParentDepth {
+		return fmt.Errorf("parent POM recursion depth exceeded limit (%d)", maxParentDepth)
+	}
+	if p.Parent.GroupID == "" || p.Parent.ArtifactID == "" || p.Parent.Version == "" {
+		return nil
+	}
+	pkey := fmt.Sprintf("%s:%s:%s", p.Parent.GroupID, p.Parent.ArtifactID, p.Parent.Version)
+	if _, visited := parentVisit.Load(pkey); visited {
+		return fmt.Errorf("detected parent cycle: %s", pkey)
+	}
+	parentVisit.Store(pkey, true)
+	parentPOM, err := retrieveOrLoadPOM(p.Parent.GroupID, p.Parent.ArtifactID, p.Parent.Version)
+	if err != nil {
+		return err
+	}
+	p.DependencyMgmt.Dependencies = mergeDepMgmt(parentPOM.DependencyMgmt.Dependencies, p.DependencyMgmt.Dependencies)
+	if p.GroupID == "" {
+		p.GroupID = parentPOM.GroupID
+	}
+	if p.Version == "" {
+		p.Version = parentPOM.Version
+	}
+	return loadAllParents(parentPOM, depth+1)
+}
+
+func fetchRemotePOM(g, a, v string) (*MavenPOM, error) {
+	groupPath := strings.ReplaceAll(g, ".", "/")
+	urlCentral := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
+	urlGoogle := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
+
+	if pm, err := fetchPOMFromURL(urlCentral); err == nil {
+		return pm, nil
+	}
+	if pm, err := fetchPOMFromURL(urlGoogle); err == nil {
+		return pm, nil
+	}
+	return nil, fmt.Errorf("could not fetch remote POM for %s:%s:%s", g, a, v)
+}
+
+func fetchPOMFromURL(url string) (*MavenPOM, error) {
+	client := http.Client{Timeout: fetchTimeout}
+	resp, err := client.Get(url)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+	var pom MavenPOM
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	dec.Strict = false
+	if err := dec.Decode(&pom); err != nil {
+		return nil, err
+	}
+	return &pom, nil
+}
+
+func mergeDepMgmt(parent, child []POMDep) []POMDep {
+	outMap := make(map[string]POMDep)
+	for _, d := range parent {
+		key := d.GroupID + ":" + d.ArtifactID
+		outMap[key] = d
+	}
+	for _, d := range child {
+		key := d.GroupID + ":" + d.ArtifactID
+		outMap[key] = d
+	}
+	var merged []POMDep
+	for _, val := range outMap {
+		merged = append(merged, val)
+	}
+	sort.Slice(merged, func(i, j int) bool {
+		return merged[i].GroupID < merged[j].GroupID
+	})
+	return merged
+}
+
+func loadPOMFromDisk(g, a, v string) (*MavenPOM, error) {
+	path := localCachePath(g, a, v)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	var pom MavenPOM
+	dec := xml.NewDecoder(bytes.NewReader(data))
+	dec.Strict = false
+	if err := dec.Decode(&pom); err != nil {
+		return nil, err
+	}
+	return &pom, nil
+}
+
+func savePOMToDisk(g, a, v string, pom *MavenPOM) error {
+	path := localCachePath(g, a, v)
+	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
+		return err
+	}
+	f, err := os.Create(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	out, err := xml.MarshalIndent(pom, "", "  ")
+	if err != nil {
+		return err
+	}
+	_, err = f.Write(out)
+	return err
+}
+
+func localCachePath(g, a, v string) string {
+	groupPath := strings.ReplaceAll(g, ".", "/")
+	return filepath.Join(localPOMCacheDir, groupPath, a, v, fmt.Sprintf("%s-%s.pom.xml", a, v))
+}
+
+// -------------------------------------------------------------------------------------
+// STEP 5: HTML REPORT GENERATION
+// -------------------------------------------------------------------------------------
+
+func buildGradleTreeHTML(node *GradleDependencyNode, level int) string {
+	class := "non-copyleft"
+	if node.License == "Unknown" {
+		class = "unknown-license"
+	} else if node.Copyleft {
+		class = "copyleft"
+	}
+	summary := fmt.Sprintf("%s@%s (License: %s)", node.Name, node.Version, node.License)
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf(`<details class="%s" style="margin-left:%dem;">`, class, level))
+	sb.WriteString(fmt.Sprintf(`<summary>%s</summary>`, template.HTMLEscapeString(summary)))
+	for _, c := range node.Transitive {
+		sb.WriteString(buildGradleTreeHTML(c, level+1))
+	}
+	sb.WriteString("</details>")
+	return sb.String()
+}
+
+func buildGradleTreesHTML(nodes []*GradleDependencyNode) template.HTML {
+	var buf strings.Builder
+	for _, n := range nodes {
+		buf.WriteString(buildGradleTreeHTML(n, 0))
+	}
+	return template.HTML(buf.String())
+}
+
+func getLicenseInfoWrapper(dep, version string) LicenseData {
+	parts := strings.Split(dep, "/")
+	if len(parts) != 2 {
+		return LicenseData{LicenseName: "Unknown"}
+	}
+	g, a := parts[0], parts[1]
+	pom, err := concurrentFetchPOM(g, a, version)
+	if err != nil || pom == nil {
+		return LicenseData{
+			LicenseName: "Unknown",
+			ProjectURL:  fmt.Sprintf("https://www.google.com/search?q=%s+%s+%s+license", g, a, version),
+		}
+	}
+	licenseName := detectLicense(pom)
+	groupPath := strings.ReplaceAll(g, ".", "/")
+	projURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/", groupPath, a, version)
+	pomURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, version, a, version)
+	return LicenseData{
+		LicenseName: licenseName,
+		ProjectURL:  projURL,
+		PomURL:      pomURL,
+	}
+}
+
+func generateHTMLReport(sections []GradleReportSection) error {
+	outDir := "./license-checker"
+	if err := os.MkdirAll(outDir, 0755); err != nil {
+		return err
+	}
+	const tmplText = `<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Gradle Dependency License Report</title>
+  <style>
+    body { font-family: Arial, sans-serif; margin: 20px; }
+    h1 { color: #2c3e50; }
+    h2 { margin-top: 40px; }
+    table { width: 100%; border-collapse: collapse; margin-bottom: 40px; }
+    th, td { border: 1px solid #ddd; padding: 8px; text-align: left; }
+    th { background-color: #f2f2f2; }
+    tr:nth-child(even) { background-color: #f9f9f9; }
+    a { color: #3498db; text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    tr.copyleft { background-color: #ffdddd; }
+    tr.non-copyleft { background-color: #ddffdd; }
+    tr.unknown-license { background-color: #ffffdd; }
+
+    details.copyleft > summary {
+      background-color: #ffdddd;
+      padding: 2px 4px;
+      border-radius: 4px;
+    }
+    details.unknown-license > summary {
+      background-color: #ffffdd;
+      padding: 2px 4px;
+      border-radius: 4px;
+    }
+    details.non-copyleft > summary {
+      background-color: #ddffdd;
+      padding: 2px 4px;
+      border-radius: 4px;
+    }
+  </style>
+</head>
+<body>
+  <h1>Gradle Dependency License Report</h1>
+  <p>This report includes both a flat table and an expandable dependency tree.</p>
+
+  {{ range . }}
+    <h2>File: {{ .FilePath }}</h2>
+    <p>Total Dependencies Found: {{ len .Dependencies }}</p>
+
+    <h3>Dependencies Table</h3>
+    <table>
+      <thead>
+        <tr>
+          <th>Dependency</th>
+          <th>Version</th>
+          <th>License</th>
+          <th>Parent</th>
+          <th>Project Details</th>
+          <th>POM File</th>
+        </tr>
+      </thead>
+      <tbody>
+        {{ range $dep, $info := .Dependencies }}
+          {{ $licData := getLicenseInfoWrapper $dep $info.Lookup }}
+          {{ if eq $licData.LicenseName "Unknown" }}
+            <tr class="unknown-license">
+          {{ else if isCopyleft $licData.LicenseName }}
+            <tr class="copyleft">
+          {{ else }}
+            <tr class="non-copyleft">
+          {{ end }}
+            <td>{{ $dep }}</td>
+            <td>{{ $info.Display }}</td>
+            <td>{{ $licData.LicenseName }}</td>
+            <td>{{ $info.Parent }}</td>
+            {{ if $licData.ProjectURL }}
+              <td><a href="{{ $licData.ProjectURL }}" target="_blank">View Details</a></td>
+            {{ else }}
+              <td></td>
+            {{ end }}
+            {{ if $licData.PomURL }}
+              <td><a href="{{ $licData.PomURL }}" target="_blank">View POM</a></td>
+            {{ else }}
+              <td></td>
+            {{ end }}
+          </tr>
+        {{ end }}
+      </tbody>
+    </table>
+
+    <h3>Dependency Tree</h3>
+    {{ buildGradleTreesHTML .DependencyTree }}
+  {{ end }}
+</body>
+</html>
+`
+	tmpl, err := template.New("report").Funcs(template.FuncMap{
+		"buildGradleTreesHTML":  buildGradleTreesHTML,
+		"getLicenseInfoWrapper": getLicenseInfoWrapper,
+		"isCopyleft":            isCopyleft,
+	}).Parse(tmplText)
+	if err != nil {
+		return err
+	}
+
+	outputFile := filepath.Join(outDir, "dependency-license-report.html")
+	f, err := os.Create(outputFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+
+	if err := tmpl.Execute(f, sections); err != nil {
+		return err
+	}
+
+	fmt.Printf("✅ License report generated at %s\n", outputFile)
+	return nil
+}
+
+// -------------------------------------------------------------------------------------
 // MAIN FUNCTION
 // -------------------------------------------------------------------------------------
 
 func main() {
+	// Ensure worker pool shuts down.
 	defer close(pomRequests)
 	defer wgWorkers.Wait()
 
@@ -926,4 +2719,7 @@ func main() {
 		fmt.Printf("Error generating HTML report: %v\n", err)
 		os.Exit(1)
 	}
+
+	// Print a summary report to the console.
+	printConsoleReport(sections)
 }
