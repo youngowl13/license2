@@ -128,7 +128,7 @@ type LicenseData struct {
 
 var (
 	pomCache    sync.Map // key = "group:artifact:version" -> *MavenPOM
-	parentVisit sync.Map // to detect cycles in parent resolution
+	parentVisit sync.Map // used to detect cycles in parent resolution
 	pomRequests = make(chan fetchRequest, 50)
 	wgWorkers   sync.WaitGroup
 
@@ -245,7 +245,7 @@ func parseAllBuildGradleFiles(files []string) ([]GradleReportSection, error) {
 
 func parseVersionRange(v string) string {
 	v = strings.TrimSpace(v)
-	// If the version is unresolved (contains a variable), leave it as is.
+	// If unresolved, leave version as-is.
 	if (strings.HasPrefix(v, "[") || strings.HasPrefix(v, "(")) && strings.Contains(v, ",") {
 		trimmed := strings.Trim(v, "[]() ")
 		parts := strings.Split(trimmed, ",")
@@ -261,7 +261,7 @@ func parseVersionRange(v string) string {
 }
 
 // -------------------------------------------------------------------------------------
-// Helper: getLatestVersion - fetches the latest version from metadata on Maven Central or Google Maven.
+// Helper: getLatestVersion - fetches the latest version from metadata on Maven Central and Google Maven.
 // -------------------------------------------------------------------------------------
 
 func getLatestVersion(g, a string) (string, error) {
@@ -273,14 +273,14 @@ func getLatestVersion(g, a string) (string, error) {
 	if err == nil && version != "" {
 		return version, nil
 	}
-	// If Maven Central fails, try Google Maven.
+	// Try Google Maven.
 	googleURL := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/maven-metadata.xml", groupPath, a)
 	fmt.Printf("getLatestVersion: Fetching metadata from Google Maven: %s\n", googleURL)
 	version, err = fetchLatestVersionFromURL(googleURL)
 	if err == nil && version != "" {
 		return version, nil
 	}
-	return "", fmt.Errorf("could not resolve version for %s:%s from Maven Central or Google Maven", g, a)
+	return "", fmt.Errorf("could not resolve version for %s:%s", g, a)
 }
 
 func fetchLatestVersionFromURL(url string) (string, error) {
@@ -321,7 +321,7 @@ func fetchLatestVersionFromURL(url string) (string, error) {
 	if len(md.Versioning.Versions) > 0 {
 		return md.Versioning.Versions[len(md.Versioning.Versions)-1], nil
 	}
-	return "", fmt.Errorf("no version found in metadata for %s:%s", g, a)
+	return "", fmt.Errorf("no version found in metadata")
 }
 
 // -------------------------------------------------------------------------------------
@@ -364,7 +364,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 			if gid == "" || aid == "" {
 				continue
 			}
-			// If version is unresolved, try to resolve dynamically.
+			// If version is unresolved, try to resolve it.
 			if strings.Contains(it.Version, "${") || it.Version == "unknown" {
 				latest, err := getLatestVersion(gid, aid)
 				if err != nil {
