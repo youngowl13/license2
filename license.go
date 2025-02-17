@@ -157,9 +157,10 @@ var (
 func pomFetchWorker() {
 	defer wgWorkers.Done()
 	for req := range pomRequests {
+		fmt.Printf("Worker: Fetching POM for %s:%s:%s\n", req.GroupID, req.ArtifactID, req.Version)
 		pom, err := retrieveOrLoadPOM(req.GroupID, req.ArtifactID, req.Version)
 		if err != nil {
-			fmt.Printf("⚠️ Error fetching POM for %s:%s:%s: %v\n", req.GroupID, req.ArtifactID, req.Version, err)
+			fmt.Printf("⚠️ Error in worker fetching POM for %s:%s:%s: %v\n", req.GroupID, req.ArtifactID, req.Version, err)
 		}
 		req.ResultChan <- fetchResult{POM: pom, Err: err}
 	}
@@ -240,6 +241,7 @@ func parseBuildGradleFile(filePath string) (map[string]ExtendedDepInfo, error) {
 func parseAllBuildGradleFiles(files []string) ([]GradleReportSection, error) {
 	var sections []GradleReportSection
 	for _, f := range files {
+		fmt.Printf("Parsing file: %s\n", f)
 		directDeps, err := parseBuildGradleFile(f)
 		if err != nil {
 			fmt.Printf("Error parsing %s: %v\n", f, err)
@@ -276,11 +278,13 @@ func parseVersionRange(v string) string {
 func buildTransitiveClosure(sections []GradleReportSection) {
 	for i := range sections {
 		sec := &sections[i]
+		fmt.Printf("Building transitive closure for file: %s\n", sec.FilePath)
 		stateMap := make(map[string]depState)
 		nodeMap := make(map[string]*GradleDependencyNode)
 		var rootNodes []*GradleDependencyNode
 		var queue []queueItem
 		visitedBFS := make(map[string]bool)
+
 		// Initialize BFS with direct dependencies.
 		for ga, info := range sec.Dependencies {
 			visitedBFS[ga] = true
@@ -299,17 +303,19 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 				ParentNode:    n,
 			})
 		}
-		// BFS loop.
+
+		// Process the BFS queue.
 		for len(queue) > 0 {
 			it := queue[0]
 			queue = queue[1:]
+			fmt.Printf("BFS: Processing dependency %s (depth %d)\n", it.GroupArtifact, it.Depth)
 			gid, aid := splitGA(it.GroupArtifact)
 			if gid == "" || aid == "" {
 				continue
 			}
 			pom, err := concurrentFetchPOM(gid, aid, it.Version)
 			if err != nil || pom == nil {
-				fmt.Printf("⚠️ Could not fetch POM for %s:%s:%s; skipping branch.\n", gid, aid, it.Version)
+				fmt.Printf("⚠️ BFS: Skipping %s:%s:%s due to error.\n", gid, aid, it.Version)
 				continue
 			}
 			if it.ParentNode != nil {
@@ -357,6 +363,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 						Depth:         childDepth,
 						ParentNode:    childNode,
 					})
+					fmt.Printf("BFS: Added %s (depth %d)\n", childGA, childDepth)
 				} else {
 					if childDepth < curSt.Depth {
 						stateMap[childGA] = depState{Version: cv, Depth: childDepth}
@@ -381,6 +388,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 							Depth:         childDepth,
 							ParentNode:    childNode,
 						})
+						fmt.Printf("BFS: Updated %s with shallower depth %d\n", childGA, childDepth)
 					}
 				}
 			}
@@ -396,6 +404,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 		for _, rn := range rootNodes {
 			fillDepMap(rn, sec.Dependencies)
 		}
+		fmt.Printf("Finished processing %s: %d direct, %d transitive dependencies found.\n", sec.FilePath, len(sec.Dependencies), sec.TransitiveCount)
 	}
 }
 
@@ -523,7 +532,6 @@ func isCopyleft(name string) bool {
 // -------------------------------------------------------------------------------------
 
 func concurrentFetchPOM(g, a, v string) (*MavenPOM, error) {
-	// (This function appears only once in this file.)
 	if g == "" || a == "" || v == "" {
 		return nil, fmt.Errorf("invalid GAV: %s:%s:%s", g, a, v)
 	}
@@ -552,7 +560,6 @@ func concurrentFetchPOM(g, a, v string) (*MavenPOM, error) {
 }
 
 func retrieveOrLoadPOM(g, a, v string) (*MavenPOM, error) {
-	// (This function appears only once in this file.)
 	key := fmt.Sprintf("%s:%s:%s", g, a, v)
 	if c, ok := pomCache.Load(key); ok {
 		return c.(*MavenPOM), nil
@@ -585,7 +592,6 @@ func retrieveOrLoadPOM(g, a, v string) (*MavenPOM, error) {
 }
 
 func loadAllParents(p *MavenPOM, depth int) error {
-	// (This function appears only once in this file.)
 	if depth > maxParentDepth {
 		return fmt.Errorf("parent POM recursion depth exceeded limit (%d)", maxParentDepth)
 	}
@@ -612,21 +618,21 @@ func loadAllParents(p *MavenPOM, depth int) error {
 }
 
 func fetchRemotePOM(g, a, v string) (*MavenPOM, error) {
-	// (This function appears only once in this file.)
 	groupPath := strings.ReplaceAll(g, ".", "/")
 	urlCentral := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
 	urlGoogle := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
 	if pm, err := fetchPOMFromURL(urlCentral); err == nil {
+		fmt.Printf("Fetched POM from Maven Central for %s:%s:%s\n", g, a, v)
 		return pm, nil
 	}
 	if pm, err := fetchPOMFromURL(urlGoogle); err == nil {
+		fmt.Printf("Fetched POM from Google Maven for %s:%s:%s\n", g, a, v)
 		return pm, nil
 	}
 	return nil, fmt.Errorf("could not fetch remote POM for %s:%s:%s", g, a, v)
 }
 
 func fetchPOMFromURL(url string) (*MavenPOM, error) {
-	// (This function appears only once in this file.)
 	client := http.Client{Timeout: fetchTimeout}
 	resp, err := client.Get(url)
 	if err != nil {
@@ -650,7 +656,6 @@ func fetchPOMFromURL(url string) (*MavenPOM, error) {
 }
 
 func mergeDepMgmt(parent, child []POMDep) []POMDep {
-	// (This function appears only once in this file.)
 	outMap := make(map[string]POMDep)
 	for _, d := range parent {
 		key := d.GroupID + ":" + d.ArtifactID
@@ -671,7 +676,6 @@ func mergeDepMgmt(parent, child []POMDep) []POMDep {
 }
 
 func loadPOMFromDisk(g, a, v string) (*MavenPOM, error) {
-	// (This function appears only once in this file.)
 	path := localCachePath(g, a, v)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -687,7 +691,6 @@ func loadPOMFromDisk(g, a, v string) (*MavenPOM, error) {
 }
 
 func savePOMToDisk(g, a, v string, pom *MavenPOM) error {
-	// (This function appears only once in this file.)
 	path := localCachePath(g, a, v)
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
@@ -706,7 +709,6 @@ func savePOMToDisk(g, a, v string, pom *MavenPOM) error {
 }
 
 func localCachePath(g, a, v string) string {
-	// (This function appears only once in this file.)
 	groupPath := strings.ReplaceAll(g, ".", "/")
 	return filepath.Join(localPOMCacheDir, groupPath, a, v, fmt.Sprintf("%s-%s.pom.xml", a, v))
 }
@@ -869,7 +871,6 @@ func generateHTMLReport(sections []GradleReportSection) error {
 	if err != nil {
 		return err
 	}
-
 	outputFile := filepath.Join(outDir, "dependency-license-report.html")
 	f, err := os.Create(outputFile)
 	if err != nil {
@@ -923,9 +924,11 @@ func printTreeNode(node *GradleDependencyNode, indent int) {
 // -------------------------------------------------------------------------------------
 
 func main() {
+	// Ensure the worker pool is shut down.
 	defer close(pomRequests)
 	defer wgWorkers.Wait()
 
+	fmt.Println("Starting dependency analysis...")
 	files, err := findBuildGradleFiles(".")
 	if err != nil {
 		fmt.Printf("Error scanning for build.gradle files: %v\n", err)
@@ -938,14 +941,14 @@ func main() {
 		fmt.Printf("Error parsing build.gradle files: %v\n", err)
 		os.Exit(1)
 	}
-
+	fmt.Println("Starting transitive dependency resolution...")
 	buildTransitiveClosure(sections)
-
+	fmt.Println("Generating HTML report...")
 	if err := generateHTMLReport(sections); err != nil {
 		fmt.Printf("Error generating HTML report: %v\n", err)
 		os.Exit(1)
 	}
-
-	// Print progress to the console.
+	fmt.Println("Printing console report...")
 	printConsoleReport(sections)
+	fmt.Println("Analysis complete.")
 }
