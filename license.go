@@ -5,23 +5,35 @@ import (
 	"encoding/xml"
 	"fmt"
 	"html/template"
+	"io"
 	"io/ioutil"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
 )
 
+// -------------------------------------------------------------------------------------
+// Data Structures
+// -------------------------------------------------------------------------------------
+
 // DepVersion holds two version strings:
-// - Display: Shown in the report’s Version column. If no literal version is declared,
-//            this is set to "version not found in build.gradle file".
+// - Display: Shown in the report’s Version column.
 // - Lookup:  Used for constructing POM URLs and retrieving license info.
-//            (If missing, dynamic lookup is attempted.)
 type DepVersion struct {
 	Display string
 	Lookup  string
+}
+
+// ExtendedDepInfo holds the DepVersion plus the dependency’s immediate parent:
+// - If it's a direct dependency, Parent = "direct".
+// - If it's transitive, Parent = GAV of the direct parent in the tree.
+type ExtendedDepInfo struct {
+	DepVersion
+	Parent string
 }
 
 // License represents the license details from a POM file.
@@ -36,22 +48,19 @@ type MavenPOM struct {
 	Licenses []License `xml:"licenses>license"`
 }
 
-// GradleReportSection holds the file path of one build.gradle file and its extracted dependencies.
+// GradleReportSection holds information for a single build.gradle file:
+// - FilePath: The path to the build.gradle
+// - RawTreeOutput: The raw text from the `gradle dependencies` command (for display in <pre>).
+// - Dependencies: A map of "group/artifact" => ExtendedDepInfo. Versions, parent info, etc.
 type GradleReportSection struct {
 	FilePath     string
-	Dependencies map[string]DepVersion
+	RawTreeOutput string
+	Dependencies map[string]ExtendedDepInfo
 }
 
-// parseVariables scans the file content for variable definitions (e.g. def cameraxVersion = "1.1.0-alpha05").
-func parseVariables(content string) map[string]string {
-	varMap := make(map[string]string)
-	re := regexp.MustCompile(`(?m)^\s*def\s+(\w+)\s*=\s*["']([^"']+)["']`)
-	matches := re.FindAllStringSubmatch(content, -1)
-	for _, match := range matches {
-		varMap[match[1]] = match[2]
-	}
-	return varMap
-}
+// -------------------------------------------------------------------------------------
+// Step 1: Find build.gradle files
+// -------------------------------------------------------------------------------------
 
 // findBuildGradleFiles recursively finds all files named "build.gradle" (case-insensitive) starting from root.
 func findBuildGradleFiles(root string) ([]string, error) {
@@ -71,113 +80,145 @@ func findBuildGradleFiles(root string) ([]string, error) {
 	return files, nil
 }
 
-// parseBuildGradleFile parses a single build.gradle file to extract dependency declarations
-// and performs variable substitution for version numbers.
-func parseBuildGradleFile(filePath string) (map[string]DepVersion, error) {
-	dependencies := make(map[string]DepVersion)
-	contentBytes, err := ioutil.ReadFile(filePath)
-	if err != nil {
-		return nil, fmt.Errorf("cannot read file %s: %v", filePath, err)
-	}
-	content := string(contentBytes)
+// -------------------------------------------------------------------------------------
+// Step 2: Execute "gradle dependencies" and capture output
+// -------------------------------------------------------------------------------------
 
-	// Parse variable definitions.
-	varMap := parseVariables(content)
+// runGradleDependencies runs `gradle dependencies` (or `./gradlew dependencies` if gradlew is available)
+// in the directory containing the build.gradle file and returns the captured output as a string.
+func runGradleDependencies(buildGradlePath string) (string, error) {
+	dir := filepath.Dir(buildGradlePath)
 
-	// Regular expression to match dependency declarations for common configurations,
-	// including "classpath".
-	re := regexp.MustCompile(`(?m)^\s*(implementation|api|compileOnly|runtimeOnly|testImplementation|androidTestImplementation|classpath)\s+['"]([^'"]+)['"]`)
-	matches := re.FindAllStringSubmatch(content, -1)
-	for _, match := range matches {
-		// match[2] is the dependency string, e.g.:
-		// "androidx.appcompat:appcompat:1.4.2", "com.onesignal:OneSignal:[4.0.0, 4.99.99]",
-		// or "androidx.camera:camera-core:${cameraxVersion}"
-		depStr := match[2]
-		parts := strings.Split(depStr, ":")
-		var group, artifact, version string
-		if len(parts) >= 3 {
-			group = parts[0]
-			artifact = parts[1]
-			version = parts[2]
-			// Handle version range: if version starts with "[" then pick the first version.
-			if strings.HasPrefix(version, "[") {
-				trimmed := strings.Trim(version, "[]")
-				tokens := strings.Split(trimmed, ",")
-				if len(tokens) > 0 {
-					version = strings.TrimSpace(tokens[0])
-				}
-			}
-			// Substitute variable interpolation if version contains "${".
-			if strings.Contains(version, "${") {
-				reVar := regexp.MustCompile(`\$\{([^}]+)\}`)
-				version = reVar.ReplaceAllStringFunc(version, func(s string) string {
-					inner := s[2 : len(s)-1]
-					if val, ok := varMap[inner]; ok {
-						return val
-					}
-					return ""
-				})
-			}
-		} else {
-			if len(parts) >= 2 {
-				group = parts[0]
-				artifact = parts[1]
-			}
-			version = ""
-		}
-		key := fmt.Sprintf("%s/%s", group, artifact)
-		var depVer DepVersion
-		if version == "" {
-			depVer = DepVersion{
-				Display: "version not found in build.gradle file",
-				Lookup:  "unknown",
-			}
-		} else {
-			depVer = DepVersion{
-				Display: version,
-				Lookup:  version,
-			}
-		}
-		// Keep the first occurrence if duplicate.
-		if _, exists := dependencies[key]; !exists {
-			dependencies[key] = depVer
+	// Check if there's a gradlew wrapper in that directory or above:
+	gradleCmd := "gradle"
+	for curDir := dir; curDir != "/" && curDir != "."; curDir = filepath.Dir(curDir) {
+		wrapperPath := filepath.Join(curDir, "gradlew")
+		if _, err := os.Stat(wrapperPath); err == nil {
+			gradleCmd = wrapperPath
+			break
 		}
 	}
-	return dependencies, nil
+
+	// We run "gradle dependencies". You might want to add flags like "--no-daemon" or a specific configuration.
+	cmd := exec.Command(gradleCmd, "dependencies")
+	cmd.Dir = dir
+
+	var outBuf, errBuf bytes.Buffer
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("error running '%s dependencies' in %s: %v\nStderr: %s",
+			gradleCmd, dir, err, errBuf.String())
+	}
+	return outBuf.String(), nil
 }
 
-// parseAllBuildGradleFiles processes each build.gradle file and returns a slice of GradleReportSection.
-func parseAllBuildGradleFiles(filePaths []string) ([]GradleReportSection, error) {
-	var sections []GradleReportSection
-	for _, f := range filePaths {
-		deps, err := parseBuildGradleFile(f)
-		if err != nil {
-			fmt.Printf("Error parsing file %s: %v\n", f, err)
+// -------------------------------------------------------------------------------------
+// Step 3: Parse the Gradle dependency tree output
+// -------------------------------------------------------------------------------------
+
+// parseDependencyLineRegex extracts GAV from lines like:
+// "+--- com.example:my-lib:1.2.3" or "\--- androidx.appcompat:appcompat:1.4.2 (*)"
+// It captures the group, artifact, and version (still including " (*)" if present).
+// We'll strip " (*)" later to handle repeated dependencies.
+var parseDependencyLineRegex = regexp.MustCompile(`(?:\+---|\\\---)\s+([\w\.\-]+):([\w\.\-]+):([\w\.\-]+(?:\s*\(\*\))?)`)
+
+// parseDependencyTreeOutput parses the raw text from "gradle dependencies" and extracts
+// each dependency with its immediate parent. We use indentation to determine parent-child relationships.
+// Returns a map of "group/artifact" => ExtendedDepInfo, storing the first parent encountered if any.
+func parseDependencyTreeOutput(output string) map[string]ExtendedDepInfo {
+	depsMap := make(map[string]ExtendedDepInfo)
+
+	lines := strings.Split(output, "\n")
+
+	// We'll keep a stack where each entry is (indentLevel, "group:artifact:version").
+	// Indent level is determined by the number of leading "|    " blocks.
+	type stackEntry struct {
+		level int
+		gav   string // e.g. "androidx.appcompat:appcompat:1.4.2"
+	}
+
+	var stack []stackEntry
+
+	// helper to find indentation level from leading "|    " sequences
+	getIndentLevel := func(line string) int {
+		// Count how many times we see "|    " from the start of the line
+		prefix := 0
+		for {
+			if strings.HasPrefix(line, "|    ") {
+				line = line[5:] // remove the first 5 characters: "|    "
+				prefix++
+			} else {
+				break
+			}
+		}
+		return prefix
+	}
+
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
 			continue
 		}
-		// For dependencies with missing Lookup version, attempt dynamic lookup.
-		for key, dep := range deps {
-			if dep.Lookup == "unknown" {
-				parts := strings.Split(key, "/")
-				if len(parts) == 2 {
-					group := parts[0]
-					artifact := parts[1]
-					if ver, err := getLatestVersionFromMavenCentral(group, artifact); err == nil && ver != "" {
-						dep.Lookup = ver
-					} else if ver, err := getLatestVersionFromGoogleMaven(group, artifact); err == nil && ver != "" {
-						dep.Lookup = ver
-					}
-					deps[key] = dep
+
+		// Check if the line has a dependency marker: +--- or \---
+		if strings.Contains(line, "+---") || strings.Contains(line, "\\---") {
+			// We have a dependency line, parse it
+			matches := parseDependencyLineRegex.FindStringSubmatch(line)
+			if len(matches) == 4 {
+				group := matches[1]
+				artifact := matches[2]
+				version := matches[3]
+				// remove " (*)" if present:
+				version = strings.TrimSpace(strings.ReplaceAll(version, "(*)", ""))
+
+				// Determine indent level => who is the parent
+				level := getIndentLevel(line)
+
+				// Pop from stack until top has level < current
+				for len(stack) > 0 && stack[len(stack)-1].level >= level {
+					stack = stack[:len(stack)-1]
 				}
+
+				var parentLabel string
+				if len(stack) == 0 {
+					// top-level => direct dependency
+					parentLabel = "direct"
+				} else {
+					parentLabel = stack[len(stack)-1].gav
+				}
+
+				// Prepare a GAV string for the current line
+				currentGAV := fmt.Sprintf("%s:%s:%s", group, artifact, version)
+
+				// store in map => "group/artifact" => ExtendedDepInfo
+				key := group + "/" + artifact
+				if _, exists := depsMap[key]; !exists {
+					depsMap[key] = ExtendedDepInfo{
+						DepVersion: DepVersion{
+							Display: version,
+							Lookup:  version,
+						},
+						Parent: parentLabel,
+					}
+				}
+
+				// push this new item to the stack
+				stack = append(stack, stackEntry{
+					level: level,
+					gav:   currentGAV,
+				})
 			}
 		}
-		sections = append(sections, GradleReportSection{
-			FilePath:     f,
-			Dependencies: deps,
-		})
 	}
-	return sections, nil
+
+	return depsMap
 }
+
+// -------------------------------------------------------------------------------------
+// Step 4: License Fetching (unchanged from original, with concurrency improvements)
+// -------------------------------------------------------------------------------------
 
 // getLatestVersionFromMavenCentral fetches the latest version from Maven Central metadata.
 func getLatestVersionFromMavenCentral(groupID, artifactID string) (string, error) {
@@ -191,7 +232,7 @@ func getLatestVersionFromMavenCentral(groupID, artifactID string) (string, error
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("error fetching maven metadata from %s: status code %d", metadataURL, resp.StatusCode)
 	}
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("error reading maven metadata from %s: %v", metadataURL, err)
 	}
@@ -224,7 +265,7 @@ func getLatestVersionFromGoogleMaven(groupID, artifactID string) (string, error)
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("error fetching google maven metadata from %s: status code %d", metadataURL, resp.StatusCode)
 	}
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return "", fmt.Errorf("error reading google maven metadata from %s: %v", metadataURL, err)
 	}
@@ -245,6 +286,7 @@ func getLatestVersionFromGoogleMaven(groupID, artifactID string) (string, error)
 	return "", fmt.Errorf("no version found in google maven metadata")
 }
 
+// fetchPOMFromURL fetches and unmarshals a Maven POM.
 func fetchPOMFromURL(url string) (*MavenPOM, error) {
 	resp, err := http.Get(url)
 	if err != nil {
@@ -254,12 +296,11 @@ func fetchPOMFromURL(url string) (*MavenPOM, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("error fetching POM from %s: status code %d", url, resp.StatusCode)
 	}
-	data, err := ioutil.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("error reading POM from %s: %v", url, err)
 	}
 	var pom MavenPOM
-	// Use a decoder with Strict mode disabled to ignore namespace issues.
 	decoder := xml.NewDecoder(bytes.NewReader(data))
 	decoder.Strict = false
 	if err := decoder.Decode(&pom); err != nil {
@@ -268,19 +309,23 @@ func fetchPOMFromURL(url string) (*MavenPOM, error) {
 	return &pom, nil
 }
 
+// fetchPOM tries to fetch from Maven Central and Google Maven concurrently.
 func fetchPOM(groupID, artifactID, version string) (string, string, *MavenPOM, error) {
 	groupPath := strings.ReplaceAll(groupID, ".", "/")
 	mavenPOMURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, artifactID, version, artifactID, version)
 	googlePOMURL := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, artifactID, version, artifactID, version)
+
 	type result struct {
 		pom        *MavenPOM
 		sourceURL  string // URL used to fetch the POM file.
-		projectURL string // URL used for the "View Details" link.
+		projectURL string // For "View Details" link.
 		err        error
 	}
+
 	resultCh := make(chan result, 2)
 	var wg sync.WaitGroup
 	wg.Add(2)
+
 	go func() {
 		defer wg.Done()
 		pom, err := fetchPOMFromURL(mavenPOMURL)
@@ -293,13 +338,16 @@ func fetchPOM(groupID, artifactID, version string) (string, string, *MavenPOM, e
 		projectURL := fmt.Sprintf("https://maven.google.com/web/index.html#%s:%s:%s", groupID, artifactID, version)
 		resultCh <- result{pom, googlePOMURL, projectURL, err}
 	}()
+
 	go func() {
 		wg.Wait()
 		close(resultCh)
 	}()
+
 	var finalSourceURL, finalProjectURL string
 	var finalPOM *MavenPOM
 	var finalError error
+
 	for res := range resultCh {
 		if res.err == nil && res.pom != nil {
 			finalSourceURL = res.sourceURL
@@ -311,6 +359,7 @@ func fetchPOM(groupID, artifactID, version string) (string, string, *MavenPOM, e
 			finalError = res.err
 		}
 	}
+
 	if finalPOM == nil {
 		searchURL := fmt.Sprintf("https://www.google.com/search?q=%s+%s+%s+license", groupID, artifactID, version)
 		return "", searchURL, nil, finalError
@@ -318,6 +367,8 @@ func fetchPOM(groupID, artifactID, version string) (string, string, *MavenPOM, e
 	return finalSourceURL, finalProjectURL, finalPOM, nil
 }
 
+// getLicenseInfo returns (licenseName, projectURL, POMFileURL).
+// If not found, it returns ("Unknown", fallbackSearchURL, "").
 func getLicenseInfo(groupID, artifactID, version string) (string, string, string) {
 	sourceURL, projectURL, pom, err := fetchPOM(groupID, artifactID, version)
 	if err != nil || pom == nil || len(pom.Licenses) == 0 {
@@ -326,30 +377,7 @@ func getLicenseInfo(groupID, artifactID, version string) (string, string, string
 	return pom.Licenses[0].Name, projectURL, sourceURL
 }
 
-func splitDependency(dep string) (string, string, error) {
-	parts := strings.Split(dep, "/")
-	if len(parts) != 2 {
-		return "", "", fmt.Errorf("invalid dependency format: %s", dep)
-	}
-	return parts[0], parts[1], nil
-}
-
-type LicenseInfo struct {
-	Name       string
-	URL        string // "View Details" link
-	POMFileURL string // "View POM" link
-}
-
-func getLicenseInfoWrapper(dep, version string) LicenseInfo {
-	groupID, artifactID, err := splitDependency(dep)
-	if err != nil {
-		fmt.Printf("Warning: Invalid dependency format '%s': %v\n", dep, err)
-		return LicenseInfo{"Unknown", "", ""}
-	}
-	name, url, pomurl := getLicenseInfo(groupID, artifactID, version)
-	return LicenseInfo{Name: name, URL: url, POMFileURL: pomurl}
-}
-
+// isCopyleft helps determine if the license appears to be copyleft by searching for typical keywords.
 func isCopyleft(licenseName string) bool {
 	copyleftKeywords := []string{
 		"GPL", "LGPL", "AGPL", "CC BY-SA", "CC-BY-SA", "MPL", "EPL", "CPL",
@@ -372,14 +400,90 @@ func isCopyleft(licenseName string) bool {
 	return false
 }
 
+// -------------------------------------------------------------------------------------
+// Step 5: Primary flow: For each build.gradle, run Gradle, parse tree, fetch licenses.
+// -------------------------------------------------------------------------------------
+
+// parseAllBuildGradleFiles processes each build.gradle file.
+// 1. Runs `gradle dependencies` (or `gradlew dependencies`).
+// 2. Parses the output for dependency GAV + parent relationships.
+// 3. Looks up missing versions if needed (if any are not resolved, but typically Gradle resolves them).
+// 4. Returns a slice of GradleReportSection (one per build.gradle).
+func parseAllBuildGradleFiles(filePaths []string) ([]GradleReportSection, error) {
+	var sections []GradleReportSection
+
+	for _, buildFile := range filePaths {
+		fmt.Printf("Processing: %s\n", buildFile)
+
+		output, err := runGradleDependencies(buildFile)
+		if err != nil {
+			fmt.Printf("Error running Gradle 'dependencies' for %s: %v\n", buildFile, err)
+			continue
+		}
+
+		depsMap := parseDependencyTreeOutput(output)
+
+		// Optional: If any version is "unknown" or we want to do dynamic version resolution, do it here.
+		// But typically, Gradle has already resolved versions in the tree output.
+
+		// Attempt dynamic lookup if version is blank or "unknown" (rare in transitive context).
+		for key, dep := range depsMap {
+			if dep.Lookup == "unknown" || dep.Lookup == "" {
+				parts := strings.Split(key, "/")
+				if len(parts) == 2 {
+					group, artifact := parts[0], parts[1]
+					if ver, errCentral := getLatestVersionFromMavenCentral(group, artifact); errCentral == nil && ver != "" {
+						dep.Lookup = ver
+					} else if verGoogle, errGoogle := getLatestVersionFromGoogleMaven(group, artifact); errGoogle == nil && verGoogle != "" {
+						dep.Lookup = verGoogle
+					}
+					depsMap[key] = dep
+				}
+			}
+		}
+
+		sections = append(sections, GradleReportSection{
+			FilePath:      buildFile,
+			RawTreeOutput: output,
+			Dependencies:  depsMap,
+		})
+	}
+
+	return sections, nil
+}
+
+// -------------------------------------------------------------------------------------
+// Step 6: HTML Report Generation
+// -------------------------------------------------------------------------------------
+
+// In the HTML, we want:
+// 1) A <pre> block showing the raw "gradle dependencies" output (the entire tree).
+// 2) A table listing each unique dependency with columns:
+//    - Dependency (group/artifact)
+//    - Version
+//    - License
+//    - Parent
+//    - Project Details (link)
+//    - POM File (link)
+
+func getLicenseInfoWrapper(dep, version string) (name, detailsURL, pomURL string) {
+	parts := strings.Split(dep, "/")
+	if len(parts) != 2 {
+		return "Unknown", "", ""
+	}
+	groupID, artifactID := parts[0], parts[1]
+	licenseName, projectURL, pomFileURL := getLicenseInfo(groupID, artifactID, version)
+	return licenseName, projectURL, pomFileURL
+}
+
 func generateHTMLReport(sections []GradleReportSection) error {
-	// Generate the report in the folder "license-checker" in the current working directory.
 	outputDir := "./license-checker"
 	if _, err := os.Stat(outputDir); os.IsNotExist(err) {
 		if err := os.Mkdir(outputDir, 0755); err != nil {
 			return fmt.Errorf("error creating output directory: %v", err)
 		}
 	}
+
 	const tmplText = `<!DOCTYPE html>
 <html>
 <head>
@@ -398,12 +502,24 @@ func generateHTMLReport(sections []GradleReportSection) error {
         tr.copyleft { background-color: #ffdddd; }
         tr.non-copyleft { background-color: #ddffdd; }
         tr.unknown-license { background-color: #ffffdd; }
+        pre {
+            background: #f6f8fa;
+            border: 1px solid #ddd;
+            padding: 10px;
+            overflow: auto;
+            max-height: 400px;
+        }
     </style>
 </head>
 <body>
     <h1>Kotlin Dependency License Report</h1>
     {{range .}}
         <h2>File: {{.FilePath}}</h2>
+
+        <h3>Full Dependency Tree</h3>
+        <pre>{{.RawTreeOutput}}</pre>
+
+        <h3>Dependencies Table</h3>
         {{if .Dependencies}}
         <table>
             <thead>
@@ -411,25 +527,35 @@ func generateHTMLReport(sections []GradleReportSection) error {
                     <th>Dependency</th>
                     <th>Version</th>
                     <th>License</th>
+                    <th>Parent</th>
                     <th>Project Details</th>
                     <th>POM File</th>
                 </tr>
             </thead>
             <tbody>
-                {{range $dep, $ver := .Dependencies}}
-                {{ $info := getLicenseInfoWrapper $dep $ver.Lookup }}
-                {{ if eq $info.Name "Unknown" }}
+                {{range $dep, $info := .Dependencies}}
+                {{ $licenseName, $projectURL, $pomURL := getLicenseInfoWrapper $dep $info.Lookup }}
+                {{ if eq $licenseName "Unknown" }}
                     <tr class="unknown-license">
-                {{ else if isCopyleft $info.Name }}
+                {{ else if isCopyleft $licenseName }}
                     <tr class="copyleft">
                 {{ else }}
                     <tr class="non-copyleft">
                 {{ end }}
                     <td>{{$dep}}</td>
-                    <td>{{$ver.Display}}</td>
-                    <td>{{$info.Name}}</td>
-                    <td><a href="{{$info.URL}}" target="_blank">View Details</a></td>
-                    <td><a href="{{$info.POMFileURL}}" target="_blank">View POM</a></td>
+                    <td>{{$info.Display}}</td>
+                    <td>{{$licenseName}}</td>
+                    <td>{{$info.Parent}}</td>
+                    {{if $projectURL}}
+                        <td><a href="{{$projectURL}}" target="_blank">View Details</a></td>
+                    {{else}}
+                        <td></td>
+                    {{end}}
+                    {{if $pomURL}}
+                        <td><a href="{{$pomURL}}" target="_blank">View POM</a></td>
+                    {{else}}
+                        <td></td>
+                    {{end}}
                 </tr>
                 {{end}}
             </tbody>
@@ -440,6 +566,7 @@ func generateHTMLReport(sections []GradleReportSection) error {
     {{end}}
 </body>
 </html>`
+
 	tmpl, err := template.New("report").Funcs(template.FuncMap{
 		"getLicenseInfoWrapper": getLicenseInfoWrapper,
 		"isCopyleft":            isCopyleft,
@@ -447,36 +574,26 @@ func generateHTMLReport(sections []GradleReportSection) error {
 	if err != nil {
 		return fmt.Errorf("error creating template: %v", err)
 	}
+
 	reportPath := filepath.Join(outputDir, "dependency-license-report.html")
 	file, err := os.Create(reportPath)
 	if err != nil {
 		return fmt.Errorf("error creating report file: %v", err)
 	}
 	defer file.Close()
+
 	err = tmpl.Execute(file, sections)
 	if err != nil {
 		return fmt.Errorf("error generating report: %v", err)
 	}
+
 	fmt.Printf("✅ License report successfully generated at %s\n", reportPath)
 	return nil
 }
 
-func captureOutput(f func()) string {
-	var buf bytes.Buffer
-	oldStdout := os.Stdout
-	oldStderr := os.Stderr
-	defer func() {
-		os.Stdout = oldStdout
-		os.Stderr = oldStderr
-	}()
-	r, w, _ := os.Pipe()
-	os.Stdout = w
-	os.Stderr = w
-	f()
-	w.Close()
-	buf.ReadFrom(r)
-	return buf.String()
-}
+// -------------------------------------------------------------------------------------
+// main()
+// -------------------------------------------------------------------------------------
 
 func main() {
 	files, err := findBuildGradleFiles(".")
@@ -485,22 +602,16 @@ func main() {
 		os.Exit(1)
 	}
 	fmt.Printf("Found %d build.gradle file(s).\n", len(files))
+
 	sections, err := parseAllBuildGradleFiles(files)
 	if err != nil {
 		fmt.Printf("Error parsing build.gradle files: %v\n", err)
 		os.Exit(1)
 	}
-	output := captureOutput(func() {
-		err = generateHTMLReport(sections)
-		if err != nil {
-			fmt.Printf("Error generating report: %v\n", err)
-			os.Exit(1)
-		}
-	})
-	logPath := "output.txt"
-	if err := ioutil.WriteFile(logPath, []byte(output), 0644); err != nil {
-		fmt.Printf("Error saving output to %s: %v\n", logPath, err)
+
+	// Generate the HTML report
+	if err := generateHTMLReport(sections); err != nil {
+		fmt.Printf("Error generating report: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Printf("Output saved to: %s\n", logPath)
 }
