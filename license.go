@@ -21,10 +21,10 @@ import (
 // -------------------------------------------------------------------------------------
 
 const (
-	localPOMCacheDir = ".pom-cache"          // Directory for disk caching of POMs
-	pomWorkerCount   = 10                    // Number of concurrent POM fetch workers
-	maxParentDepth   = 10                    // Maximum parent POM resolution depth
-	fetchTimeout     = 30 * time.Second      // Increased HTTP request timeout to 30 seconds
+	localPOMCacheDir = ".pom-cache"         // Directory for disk caching of POMs
+	pomWorkerCount   = 10                   // Number of concurrent POM fetch workers
+	maxParentDepth   = 10                   // Maximum parent POM resolution depth
+	fetchTimeout     = 30 * time.Second     // HTTP request timeout (30 seconds)
 )
 
 // -------------------------------------------------------------------------------------
@@ -37,7 +37,7 @@ type GradleDependencyNode struct {
 	Version    string
 	License    string
 	Copyleft   bool
-	Parent     string // "direct" for direct dependencies or parent's GAV for transitive ones.
+	Parent     string // "direct" or parent's GAV for transitive dependencies.
 	Transitive []*GradleDependencyNode
 }
 
@@ -215,24 +215,12 @@ func parseBuildGradleFile(filePath string) (map[string]ExtendedDepInfo, error) {
 		version := "unknown"
 		if len(parts) >= 3 {
 			version = parseVersionRange(parts[2])
-			if strings.Contains(version, "${") {
-				reVar := regexp.MustCompile(`\$\{([^}]+)\}`)
-				version = reVar.ReplaceAllStringFunc(version, func(s string) string {
-					inner := s[2 : len(s)-1]
-					if val, ok := varMap[inner]; ok {
-						return val
-					}
-					return ""
-				})
-			}
 		}
 		key := group + "/" + artifact
-		if _, exists := deps[key]; !exists {
-			deps[key] = ExtendedDepInfo{
-				Display: version,
-				Lookup:  version,
-				Parent:  "direct",
-			}
+		deps[key] = ExtendedDepInfo{
+			Display: version,
+			Lookup:  version,
+			Parent:  "direct",
 		}
 	}
 	return deps, nil
@@ -257,6 +245,7 @@ func parseAllBuildGradleFiles(files []string) ([]GradleReportSection, error) {
 
 func parseVersionRange(v string) string {
 	v = strings.TrimSpace(v)
+	// If the version is unresolved (contains a variable), leave it as is.
 	if (strings.HasPrefix(v, "[") || strings.HasPrefix(v, "(")) && strings.Contains(v, ",") {
 		trimmed := strings.Trim(v, "[]() ")
 		parts := strings.Split(trimmed, ",")
@@ -269,6 +258,70 @@ func parseVersionRange(v string) string {
 		}
 	}
 	return v
+}
+
+// -------------------------------------------------------------------------------------
+// Helper: getLatestVersion - fetches the latest version from metadata on Maven Central or Google Maven.
+// -------------------------------------------------------------------------------------
+
+func getLatestVersion(g, a string) (string, error) {
+	groupPath := strings.ReplaceAll(g, ".", "/")
+	// Try Maven Central first.
+	mavenURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/maven-metadata.xml", groupPath, a)
+	fmt.Printf("getLatestVersion: Fetching metadata from Maven Central: %s\n", mavenURL)
+	version, err := fetchLatestVersionFromURL(mavenURL)
+	if err == nil && version != "" {
+		return version, nil
+	}
+	// If Maven Central fails, try Google Maven.
+	googleURL := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/maven-metadata.xml", groupPath, a)
+	fmt.Printf("getLatestVersion: Fetching metadata from Google Maven: %s\n", googleURL)
+	version, err = fetchLatestVersionFromURL(googleURL)
+	if err == nil && version != "" {
+		return version, nil
+	}
+	return "", fmt.Errorf("could not resolve version for %s:%s from Maven Central or Google Maven", g, a)
+}
+
+func fetchLatestVersionFromURL(url string) (string, error) {
+	client := http.Client{Timeout: 15 * time.Second}
+	resp, err := client.Get(url)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("HTTP %d for metadata URL %s", resp.StatusCode, url)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	type Versioning struct {
+		Latest   string   `xml:"latest"`
+		Release  string   `xml:"release"`
+		Versions []string `xml:"versions>version"`
+	}
+	type Metadata struct {
+		GroupID    string     `xml:"groupId"`
+		ArtifactID string     `xml:"artifactId"`
+		Versioning Versioning `xml:"versioning"`
+	}
+	var md Metadata
+	err = xml.Unmarshal(data, &md)
+	if err != nil {
+		return "", err
+	}
+	if md.Versioning.Release != "" {
+		return md.Versioning.Release, nil
+	}
+	if md.Versioning.Latest != "" {
+		return md.Versioning.Latest, nil
+	}
+	if len(md.Versioning.Versions) > 0 {
+		return md.Versioning.Versions[len(md.Versioning.Versions)-1], nil
+	}
+	return "", fmt.Errorf("no version found in metadata for %s:%s", g, a)
 }
 
 // -------------------------------------------------------------------------------------
@@ -311,6 +364,16 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 			if gid == "" || aid == "" {
 				continue
 			}
+			// If version is unresolved, try to resolve dynamically.
+			if strings.Contains(it.Version, "${") || it.Version == "unknown" {
+				latest, err := getLatestVersion(gid, aid)
+				if err != nil {
+					fmt.Printf("BFS: Failed to resolve latest version for %s/%s: %v\n", gid, aid, err)
+					continue
+				}
+				fmt.Printf("BFS: Resolved latest version for %s/%s: %s\n", gid, aid, latest)
+				it.Version = latest
+			}
 			pom, err := concurrentFetchPOM(gid, aid, it.Version)
 			if err != nil || pom == nil {
 				fmt.Printf("BFS: Skipping %s:%s:%s due to error at %s\n", gid, aid, it.Version, time.Now().Format(time.RFC3339))
@@ -328,12 +391,14 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 				}
 				childGA := d.GroupID + "/" + d.ArtifactID
 				cv := parseVersionRange(d.Version)
-				if cv == "" {
-					if mv, ok := managed[childGA]; ok && mv != "" {
-						cv = mv
-					} else {
-						cv = fallbackVersionRange(pom, d.GroupID, d.ArtifactID)
+				if cv == "" || strings.Contains(cv, "${") {
+					latest, err := getLatestVersion(d.GroupID, d.ArtifactID)
+					if err != nil {
+						fmt.Printf("BFS: Failed to resolve latest version for %s/%s: %v\n", d.GroupID, d.ArtifactID, err)
+						continue
 					}
+					fmt.Printf("BFS: Resolved latest version for %s/%s: %s\n", d.GroupID, d.ArtifactID, latest)
+					cv = latest
 				}
 				if cv == "" {
 					continue
@@ -951,13 +1016,13 @@ func printTreeNode(node *GradleDependencyNode, indent int) {
 func main() {
 	defer close(pomRequests)
 	defer wgWorkers.Wait()
-	
-	// Start worker pool.
+
+	// Start the worker pool.
 	for i := 0; i < pomWorkerCount; i++ {
 		wgWorkers.Add(1)
 		go pomFetchWorker()
 	}
-	
+
 	fmt.Println("Starting dependency analysis...")
 	files, err := findBuildGradleFiles(".")
 	if err != nil {
