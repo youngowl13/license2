@@ -151,18 +151,9 @@ var (
 )
 
 // -------------------------------------------------------------------------------------
-// WORKER POOL INIT
+// WORKER POOL FUNCTIONS
 // -------------------------------------------------------------------------------------
 
-func init() {
-	_ = os.MkdirAll(localPOMCacheDir, 0755)
-	wgWorkers.Add(pomWorkerCount)
-	for i := 0; i < pomWorkerCount; i++ {
-		go pomFetchWorker()
-	}
-}
-
-// pomFetchWorker processes fetchRequests concurrently.
 func pomFetchWorker() {
 	defer wgWorkers.Done()
 	for req := range pomRequests {
@@ -210,7 +201,6 @@ func parseBuildGradleFile(filePath string) (map[string]ExtendedDepInfo, error) {
 	content := string(data)
 	varMap := parseVariables(content)
 	deps := make(map[string]ExtendedDepInfo)
-
 	re := regexp.MustCompile(`(?m)^\s*(implementation|api|compileOnly|runtimeOnly|testImplementation|androidTestImplementation|classpath)\s+['"]([^'"]+)['"]`)
 	matches := re.FindAllStringSubmatch(content, -1)
 	for _, m := range matches {
@@ -290,8 +280,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 		nodeMap := make(map[string]*GradleDependencyNode)
 		var rootNodes []*GradleDependencyNode
 		var queue []queueItem
-		visitedBFS := make(map[string]bool) // Track visited dependencies in this BFS
-
+		visitedBFS := make(map[string]bool)
 		// Initialize BFS with direct dependencies.
 		for ga, info := range sec.Dependencies {
 			visitedBFS[ga] = true
@@ -310,12 +299,10 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 				ParentNode:    n,
 			})
 		}
-
 		// BFS loop.
 		for len(queue) > 0 {
 			it := queue[0]
 			queue = queue[1:]
-
 			gid, aid := splitGA(it.GroupArtifact)
 			if gid == "" || aid == "" {
 				continue
@@ -325,13 +312,11 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 				fmt.Printf("⚠️ Could not fetch POM for %s:%s:%s; skipping branch.\n", gid, aid, it.Version)
 				continue
 			}
-
 			if it.ParentNode != nil {
 				licName := detectLicense(pom)
 				it.ParentNode.License = licName
 				it.ParentNode.Copyleft = isCopyleft(licName)
 			}
-
 			managed := parseManagedVersions(pom)
 			for _, d := range pom.Dependencies {
 				if skipScope(d.Scope, d.Optional) {
@@ -354,7 +339,6 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 					continue
 				}
 				visitedBFS[childGA] = true
-
 				curSt, seen := stateMap[childGA]
 				if !seen {
 					stateMap[childGA] = depState{Version: cv, Depth: childDepth}
@@ -401,7 +385,6 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 				}
 			}
 		}
-
 		sortRoots(rootNodes)
 		sec.DependencyTree = rootNodes
 		total := 0
@@ -410,7 +393,6 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 		}
 		direct := len(rootNodes)
 		sec.TransitiveCount = total - direct
-
 		for _, rn := range rootNodes {
 			fillDepMap(rn, sec.Dependencies)
 		}
@@ -541,6 +523,7 @@ func isCopyleft(name string) bool {
 // -------------------------------------------------------------------------------------
 
 func concurrentFetchPOM(g, a, v string) (*MavenPOM, error) {
+	// (This function appears only once in this file.)
 	if g == "" || a == "" || v == "" {
 		return nil, fmt.Errorf("invalid GAV: %s:%s:%s", g, a, v)
 	}
@@ -569,6 +552,7 @@ func concurrentFetchPOM(g, a, v string) (*MavenPOM, error) {
 }
 
 func retrieveOrLoadPOM(g, a, v string) (*MavenPOM, error) {
+	// (This function appears only once in this file.)
 	key := fmt.Sprintf("%s:%s:%s", g, a, v)
 	if c, ok := pomCache.Load(key); ok {
 		return c.(*MavenPOM), nil
@@ -601,6 +585,7 @@ func retrieveOrLoadPOM(g, a, v string) (*MavenPOM, error) {
 }
 
 func loadAllParents(p *MavenPOM, depth int) error {
+	// (This function appears only once in this file.)
 	if depth > maxParentDepth {
 		return fmt.Errorf("parent POM recursion depth exceeded limit (%d)", maxParentDepth)
 	}
@@ -627,10 +612,10 @@ func loadAllParents(p *MavenPOM, depth int) error {
 }
 
 func fetchRemotePOM(g, a, v string) (*MavenPOM, error) {
+	// (This function appears only once in this file.)
 	groupPath := strings.ReplaceAll(g, ".", "/")
 	urlCentral := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
 	urlGoogle := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
-
 	if pm, err := fetchPOMFromURL(urlCentral); err == nil {
 		return pm, nil
 	}
@@ -641,6 +626,7 @@ func fetchRemotePOM(g, a, v string) (*MavenPOM, error) {
 }
 
 func fetchPOMFromURL(url string) (*MavenPOM, error) {
+	// (This function appears only once in this file.)
 	client := http.Client{Timeout: fetchTimeout}
 	resp, err := client.Get(url)
 	if err != nil {
@@ -664,6 +650,7 @@ func fetchPOMFromURL(url string) (*MavenPOM, error) {
 }
 
 func mergeDepMgmt(parent, child []POMDep) []POMDep {
+	// (This function appears only once in this file.)
 	outMap := make(map[string]POMDep)
 	for _, d := range parent {
 		key := d.GroupID + ":" + d.ArtifactID
@@ -684,6 +671,7 @@ func mergeDepMgmt(parent, child []POMDep) []POMDep {
 }
 
 func loadPOMFromDisk(g, a, v string) (*MavenPOM, error) {
+	// (This function appears only once in this file.)
 	path := localCachePath(g, a, v)
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -699,6 +687,7 @@ func loadPOMFromDisk(g, a, v string) (*MavenPOM, error) {
 }
 
 func savePOMToDisk(g, a, v string, pom *MavenPOM) error {
+	// (This function appears only once in this file.)
 	path := localCachePath(g, a, v)
 	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
 		return err
@@ -717,6 +706,7 @@ func savePOMToDisk(g, a, v string, pom *MavenPOM) error {
 }
 
 func localCachePath(g, a, v string) string {
+	// (This function appears only once in this file.)
 	groupPath := strings.ReplaceAll(g, ".", "/")
 	return filepath.Join(localPOMCacheDir, groupPath, a, v, fmt.Sprintf("%s-%s.pom.xml", a, v))
 }
@@ -886,11 +876,9 @@ func generateHTMLReport(sections []GradleReportSection) error {
 		return err
 	}
 	defer f.Close()
-
 	if err := tmpl.Execute(f, sections); err != nil {
 		return err
 	}
-
 	fmt.Printf("✅ License report generated at %s\n", outputFile)
 	return nil
 }
@@ -931,196 +919,10 @@ func printTreeNode(node *GradleDependencyNode, indent int) {
 }
 
 // -------------------------------------------------------------------------------------
-// STEP 4: CONCURRENT POM FETCH & DISK CACHING (continued)
-// -------------------------------------------------------------------------------------
-
-func concurrentFetchPOM(g, a, v string) (*MavenPOM, error) {
-	if g == "" || a == "" || v == "" {
-		return nil, fmt.Errorf("invalid GAV: %s:%s:%s", g, a, v)
-	}
-	key := fmt.Sprintf("%s:%s:%s", g, a, v)
-	if c, ok := pomCache.Load(key); ok {
-		return c.(*MavenPOM), nil
-	}
-	resultChan := make(chan fetchResult, 1)
-	pomRequests <- fetchRequest{
-		GroupID:    g,
-		ArtifactID: a,
-		Version:    v,
-		ResultChan: resultChan,
-	}
-	res := <-resultChan
-	if res.Err != nil {
-		fmt.Printf("⚠️ Error fetching POM for %s:%s:%s: %v\n", g, a, v, res.Err)
-		return nil, nil
-	}
-	if res.POM == nil {
-		fmt.Printf("⚠️ No POM found for %s:%s:%s\n", g, a, v)
-		return nil, nil
-	}
-	pomCache.Store(key, res.POM)
-	return res.POM, nil
-}
-
-func retrieveOrLoadPOM(g, a, v string) (*MavenPOM, error) {
-	key := fmt.Sprintf("%s:%s:%s", g, a, v)
-	if c, ok := pomCache.Load(key); ok {
-		return c.(*MavenPOM), nil
-	}
-	pom, err := loadPOMFromDisk(g, a, v)
-	if err == nil && pom != nil {
-		pomCache.Store(key, pom)
-	} else {
-		pom, err = fetchRemotePOM(g, a, v)
-		if err != nil {
-			return nil, err
-		}
-		_ = savePOMToDisk(g, a, v, pom)
-		pomCache.Store(key, pom)
-	}
-	if pom == nil {
-		return nil, fmt.Errorf("no POM for %s", key)
-	}
-	if pom.GroupID == "" {
-		pom.GroupID = pom.Parent.GroupID
-	}
-	if pom.Version == "" {
-		pom.Version = pom.Parent.Version
-	}
-	err = loadAllParents(pom, 0)
-	if err != nil {
-		fmt.Printf("⚠️ Parent loading issue for %s:%s:%s: %v\n", g, a, v, err)
-	}
-	return pom, nil
-}
-
-func loadAllParents(p *MavenPOM, depth int) error {
-	if depth > maxParentDepth {
-		return fmt.Errorf("parent POM recursion depth exceeded limit (%d)", maxParentDepth)
-	}
-	if p.Parent.GroupID == "" || p.Parent.ArtifactID == "" || p.Parent.Version == "" {
-		return nil
-	}
-	pkey := fmt.Sprintf("%s:%s:%s", p.Parent.GroupID, p.Parent.ArtifactID, p.Parent.Version)
-	if _, visited := parentVisit.Load(pkey); visited {
-		return fmt.Errorf("detected parent cycle: %s", pkey)
-	}
-	parentVisit.Store(pkey, true)
-	parentPOM, err := retrieveOrLoadPOM(p.Parent.GroupID, p.Parent.ArtifactID, p.Parent.Version)
-	if err != nil {
-		return err
-	}
-	p.DependencyMgmt.Dependencies = mergeDepMgmt(parentPOM.DependencyMgmt.Dependencies, p.DependencyMgmt.Dependencies)
-	if p.GroupID == "" {
-		p.GroupID = parentPOM.GroupID
-	}
-	if p.Version == "" {
-		p.Version = parentPOM.Version
-	}
-	return loadAllParents(parentPOM, depth+1)
-}
-
-func fetchRemotePOM(g, a, v string) (*MavenPOM, error) {
-	groupPath := strings.ReplaceAll(g, ".", "/")
-	urlCentral := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
-	urlGoogle := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
-
-	if pm, err := fetchPOMFromURL(urlCentral); err == nil {
-		return pm, nil
-	}
-	if pm, err := fetchPOMFromURL(urlGoogle); err == nil {
-		return pm, nil
-	}
-	return nil, fmt.Errorf("could not fetch remote POM for %s:%s:%s", g, a, v)
-}
-
-func fetchPOMFromURL(url string) (*MavenPOM, error) {
-	client := http.Client{Timeout: fetchTimeout}
-	resp, err := client.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
-	}
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	var pom MavenPOM
-	dec := xml.NewDecoder(bytes.NewReader(data))
-	dec.Strict = false
-	if err := dec.Decode(&pom); err != nil {
-		return nil, err
-	}
-	return &pom, nil
-}
-
-func mergeDepMgmt(parent, child []POMDep) []POMDep {
-	outMap := make(map[string]POMDep)
-	for _, d := range parent {
-		key := d.GroupID + ":" + d.ArtifactID
-		outMap[key] = d
-	}
-	for _, d := range child {
-		key := d.GroupID + ":" + d.ArtifactID
-		outMap[key] = d
-	}
-	var merged []POMDep
-	for _, val := range outMap {
-		merged = append(merged, val)
-	}
-	sort.Slice(merged, func(i, j int) bool {
-		return merged[i].GroupID < merged[j].GroupID
-	})
-	return merged
-}
-
-func loadPOMFromDisk(g, a, v string) (*MavenPOM, error) {
-	path := localCachePath(g, a, v)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var pom MavenPOM
-	dec := xml.NewDecoder(bytes.NewReader(data))
-	dec.Strict = false
-	if err := dec.Decode(&pom); err != nil {
-		return nil, err
-	}
-	return &pom, nil
-}
-
-func savePOMToDisk(g, a, v string, pom *MavenPOM) error {
-	path := localCachePath(g, a, v)
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	out, err := xml.MarshalIndent(pom, "", "  ")
-	if err != nil {
-		return err
-	}
-	_, err = f.Write(out)
-	return err
-}
-
-func localCachePath(g, a, v string) string {
-	groupPath := strings.ReplaceAll(g, ".", "/")
-	return filepath.Join(localPOMCacheDir, groupPath, a, v, fmt.Sprintf("%s-%s.pom.xml", a, v))
-}
-
-// -------------------------------------------------------------------------------------
 // MAIN FUNCTION
 // -------------------------------------------------------------------------------------
 
 func main() {
-	// Ensure worker pool shuts down.
 	defer close(pomRequests)
 	defer wgWorkers.Wait()
 
@@ -1144,6 +946,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Print progress report to console.
+	// Print progress to the console.
 	printConsoleReport(sections)
 }
