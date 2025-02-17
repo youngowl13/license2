@@ -215,6 +215,17 @@ func parseBuildGradleFile(filePath string) (map[string]ExtendedDepInfo, error) {
 		version := "unknown"
 		if len(parts) >= 3 {
 			version = parseVersionRange(parts[2])
+			// Do variable interpolation if needed.
+			if strings.Contains(version, "${") {
+				reVar := regexp.MustCompile(`\$\{([^}]+)\}`)
+				version = reVar.ReplaceAllStringFunc(version, func(s string) string {
+					inner := s[2 : len(s)-1]
+					if val, ok := varMap[inner]; ok {
+						return val
+					}
+					return ""
+				})
+			}
 		}
 		key := group + "/" + artifact
 		deps[key] = ExtendedDepInfo{
@@ -245,7 +256,7 @@ func parseAllBuildGradleFiles(files []string) ([]GradleReportSection, error) {
 
 func parseVersionRange(v string) string {
 	v = strings.TrimSpace(v)
-	// If unresolved, leave version as-is.
+	// If unresolved, leave as-is.
 	if (strings.HasPrefix(v, "[") || strings.HasPrefix(v, "(")) && strings.Contains(v, ",") {
 		trimmed := strings.Trim(v, "[]() ")
 		parts := strings.Split(trimmed, ",")
@@ -321,7 +332,7 @@ func fetchLatestVersionFromURL(url string) (string, error) {
 	if len(md.Versioning.Versions) > 0 {
 		return md.Versioning.Versions[len(md.Versioning.Versions)-1], nil
 	}
-	return "", fmt.Errorf("no version found in metadata")
+	return "", fmt.Errorf("no version found in metadata for %s:%s", g, a)
 }
 
 // -------------------------------------------------------------------------------------
@@ -364,7 +375,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 			if gid == "" || aid == "" {
 				continue
 			}
-			// If version is unresolved, try to resolve it.
+			// If the version is unresolved, try to resolve it dynamically.
 			if strings.Contains(it.Version, "${") || it.Version == "unknown" {
 				latest, err := getLatestVersion(gid, aid)
 				if err != nil {
@@ -391,14 +402,19 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 				}
 				childGA := d.GroupID + "/" + d.ArtifactID
 				cv := parseVersionRange(d.Version)
+				// Use managed version if available.
 				if cv == "" || strings.Contains(cv, "${") {
-					latest, err := getLatestVersion(d.GroupID, d.ArtifactID)
-					if err != nil {
-						fmt.Printf("BFS: Failed to resolve latest version for %s/%s: %v\n", d.GroupID, d.ArtifactID, err)
-						continue
+					if mv, ok := managed[childGA]; ok && mv != "" {
+						cv = mv
+					} else {
+						latest, err := getLatestVersion(d.GroupID, d.ArtifactID)
+						if err != nil {
+							fmt.Printf("BFS: Failed to resolve latest version for %s/%s: %v\n", d.GroupID, d.ArtifactID, err)
+							continue
+						}
+						fmt.Printf("BFS: Resolved latest version for %s/%s: %s\n", d.GroupID, d.ArtifactID, latest)
+						cv = latest
 					}
-					fmt.Printf("BFS: Resolved latest version for %s/%s: %s\n", d.GroupID, d.ArtifactID, latest)
-					cv = latest
 				}
 				if cv == "" {
 					continue
