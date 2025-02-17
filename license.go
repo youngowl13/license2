@@ -37,14 +37,14 @@ type GradleDependencyNode struct {
 	Version    string
 	License    string
 	Copyleft   bool
-	Parent     string // "direct" or parent's GAV for transitive dependencies.
+	Parent     string // "direct" for direct dependencies or parent's GAV for transitive dependencies.
 	Transitive []*GradleDependencyNode
 }
 
 // ExtendedDepInfo is used for the flat dependency table.
 type ExtendedDepInfo struct {
-	Display string // Version to display
-	Lookup  string // Version used for resolution
+	Display string // Version to display (if unresolved, "version not available")
+	Lookup  string // Version used for resolution (may be "unknown" or contain a variable)
 	Parent  string // "direct" or parent's GAV
 }
 
@@ -215,6 +215,7 @@ func parseBuildGradleFile(filePath string) (map[string]ExtendedDepInfo, error) {
 		version := "unknown"
 		if len(parts) >= 3 {
 			version = parseVersionRange(parts[2])
+			// Variable interpolation
 			if strings.Contains(version, "${") {
 				reVar := regexp.MustCompile(`\$\{([^}]+)\}`)
 				version = reVar.ReplaceAllStringFunc(version, func(s string) string {
@@ -255,6 +256,7 @@ func parseAllBuildGradleFiles(files []string) ([]GradleReportSection, error) {
 
 func parseVersionRange(v string) string {
 	v = strings.TrimSpace(v)
+	// If unresolved, leave as-is.
 	if (strings.HasPrefix(v, "[") || strings.HasPrefix(v, "(")) && strings.Contains(v, ",") {
 		trimmed := strings.Trim(v, "[]() ")
 		parts := strings.Split(trimmed, ",")
@@ -330,7 +332,7 @@ func fetchLatestVersionFromURL(url string) (string, error) {
 	if len(md.Versioning.Versions) > 0 {
 		return md.Versioning.Versions[len(md.Versioning.Versions)-1], nil
 	}
-	return "", fmt.Errorf("no version found in metadata for %s:%s", g, a)
+	return "", fmt.Errorf("no version found in metadata for URL %s", url)
 }
 
 // -------------------------------------------------------------------------------------
@@ -378,7 +380,6 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 				latest, err := getLatestVersion(gid, aid)
 				if err != nil {
 					fmt.Printf("BFS: Failed to resolve latest version for %s/%s: %v\n", gid, aid, err)
-					// Instead of fetching a dynamic version, we leave it unresolved.
 					it.Version = "unknown"
 				} else {
 					fmt.Printf("BFS: Resolved latest version for %s/%s: %s\n", gid, aid, latest)
@@ -402,7 +403,6 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 				}
 				childGA := d.GroupID + "/" + d.ArtifactID
 				cv := parseVersionRange(d.Version)
-				// Use managed version if available.
 				if cv == "" || strings.Contains(cv, "${") {
 					if mv, ok := managed[childGA]; ok && mv != "" {
 						cv = mv
@@ -480,7 +480,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 		}
 		direct := len(rootNodes)
 		sec.TransitiveCount = total - direct
-		// For dependencies that originally had unresolved versions, set Display to "version not available"
+		// For unresolved versions, set Display to "version not available"
 		for key, info := range sec.Dependencies {
 			if strings.Contains(info.Lookup, "${") || strings.ToLower(info.Lookup) == "unknown" {
 				info.Display = "version not available"
@@ -863,7 +863,7 @@ func getLicenseInfoWrapper(dep, version string) LicenseData {
 		return LicenseData{LicenseName: "Unknown"}
 	}
 	g, a := parts[0], parts[1]
-	// If the version is still unresolved, return a Google search URL.
+	// If the version is unresolved, return a Google search URL.
 	if strings.Contains(version, "${") || strings.ToLower(version) == "unknown" {
 		return LicenseData{
 			LicenseName: "Unknown",
@@ -1046,31 +1046,4 @@ func main() {
 	defer wgWorkers.Wait()
 
 	// Start the worker pool.
-	for i := 0; i < pomWorkerCount; i++ {
-		wgWorkers.Add(1)
-		go pomFetchWorker()
-	}
-
-	fmt.Println("Starting dependency analysis...")
-	files, err := findBuildGradleFiles(".")
-	if err != nil {
-		fmt.Printf("Error scanning for build.gradle files: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("Found %d build.gradle file(s).\n", len(files))
-	sections, err := parseAllBuildGradleFiles(files)
-	if err != nil {
-		fmt.Printf("Error parsing build.gradle files: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Println("Starting transitive dependency resolution...")
-	buildTransitiveClosure(sections)
-	fmt.Println("Generating HTML report...")
-	if err := generateHTMLReport(sections); err != nil {
-		fmt.Printf("Error generating HTML report: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Println("Printing console report...")
-	printConsoleReport(sections)
-	fmt.Println("Analysis complete.")
-}
+	f
