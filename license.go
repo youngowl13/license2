@@ -330,7 +330,7 @@ func fetchLatestVersionFromURL(url string) (string, error) {
 	if len(md.Versioning.Versions) > 0 {
 		return md.Versioning.Versions[len(md.Versioning.Versions)-1], nil
 	}
-	return "", fmt.Errorf("no version found in metadata from URL %s", url)
+	return "", fmt.Errorf("no version found in metadata for %s:%s", g, a)
 }
 
 // -------------------------------------------------------------------------------------
@@ -373,15 +373,17 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 			if gid == "" || aid == "" {
 				continue
 			}
-			// If the version is unresolved, try to resolve dynamically.
-			if strings.Contains(it.Version, "${") || it.Version == "unknown" {
+			// If the version is unresolved, try to resolve it dynamically.
+			if strings.Contains(it.Version, "${") || strings.ToLower(it.Version) == "unknown" {
 				latest, err := getLatestVersion(gid, aid)
 				if err != nil {
 					fmt.Printf("BFS: Failed to resolve latest version for %s/%s: %v\n", gid, aid, err)
-					continue
+					// Instead of fetching a dynamic version, we leave it unresolved.
+					it.Version = "unknown"
+				} else {
+					fmt.Printf("BFS: Resolved latest version for %s/%s: %s\n", gid, aid, latest)
+					it.Version = latest
 				}
-				fmt.Printf("BFS: Resolved latest version for %s/%s: %s\n", gid, aid, latest)
-				it.Version = latest
 			}
 			pom, err := concurrentFetchPOM(gid, aid, it.Version)
 			if err != nil || pom == nil {
@@ -478,8 +480,12 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 		}
 		direct := len(rootNodes)
 		sec.TransitiveCount = total - direct
-		for _, rn := range rootNodes {
-			fillDepMap(rn, sec.Dependencies)
+		// For dependencies that originally had unresolved versions, set Display to "version not available"
+		for key, info := range sec.Dependencies {
+			if strings.Contains(info.Lookup, "${") || strings.ToLower(info.Lookup) == "unknown" {
+				info.Display = "version not available"
+				sec.Dependencies[key] = info
+			}
 		}
 		fmt.Printf("Finished processing %s: %d direct, %d transitive dependencies found.\n", sec.FilePath, len(sec.Dependencies), sec.TransitiveCount)
 	}
@@ -857,6 +863,14 @@ func getLicenseInfoWrapper(dep, version string) LicenseData {
 		return LicenseData{LicenseName: "Unknown"}
 	}
 	g, a := parts[0], parts[1]
+	// If the version is still unresolved, return a Google search URL.
+	if strings.Contains(version, "${") || strings.ToLower(version) == "unknown" {
+		return LicenseData{
+			LicenseName: "Unknown",
+			ProjectURL:  fmt.Sprintf("https://www.google.com/search?q=%s+%s+license", g, a),
+			PomURL:      "",
+		}
+	}
 	pom, err := concurrentFetchPOM(g, a, version)
 	if err != nil || pom == nil {
 		return LicenseData{
