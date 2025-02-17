@@ -1,4 +1,3 @@
-<image-tokens-begin>52,0<image-tokens-end>
 package main
 
 import (
