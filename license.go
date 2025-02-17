@@ -215,7 +215,6 @@ func parseBuildGradleFile(filePath string) (map[string]ExtendedDepInfo, error) {
 		version := "unknown"
 		if len(parts) >= 3 {
 			version = parseVersionRange(parts[2])
-			// Do variable interpolation if needed.
 			if strings.Contains(version, "${") {
 				reVar := regexp.MustCompile(`\$\{([^}]+)\}`)
 				version = reVar.ReplaceAllStringFunc(version, func(s string) string {
@@ -256,7 +255,6 @@ func parseAllBuildGradleFiles(files []string) ([]GradleReportSection, error) {
 
 func parseVersionRange(v string) string {
 	v = strings.TrimSpace(v)
-	// If unresolved, leave as-is.
 	if (strings.HasPrefix(v, "[") || strings.HasPrefix(v, "(")) && strings.Contains(v, ",") {
 		trimmed := strings.Trim(v, "[]() ")
 		parts := strings.Split(trimmed, ",")
@@ -332,7 +330,7 @@ func fetchLatestVersionFromURL(url string) (string, error) {
 	if len(md.Versioning.Versions) > 0 {
 		return md.Versioning.Versions[len(md.Versioning.Versions)-1], nil
 	}
-	return "", fmt.Errorf("no version found in metadata for %s:%s", g, a)
+	return "", fmt.Errorf("no version found in metadata from URL %s", url)
 }
 
 // -------------------------------------------------------------------------------------
@@ -375,7 +373,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 			if gid == "" || aid == "" {
 				continue
 			}
-			// If the version is unresolved, try to resolve it dynamically.
+			// If the version is unresolved, try to resolve dynamically.
 			if strings.Contains(it.Version, "${") || it.Version == "unknown" {
 				latest, err := getLatestVersion(gid, aid)
 				if err != nil {
