@@ -31,7 +31,6 @@ const (
 // DATA STRUCTURES
 // -------------------------------------------------------------------------------------
 
-// GradleDependencyNode represents one node in the dependency tree.
 type GradleDependencyNode struct {
 	Name       string
 	Version    string
@@ -41,14 +40,12 @@ type GradleDependencyNode struct {
 	Transitive []*GradleDependencyNode
 }
 
-// ExtendedDepInfo is used for the flat dependency table.
 type ExtendedDepInfo struct {
 	Display string // Version to display
 	Lookup  string // Version used for resolution
 	Parent  string // "direct" or parent's GAV
 }
 
-// GradleReportSection holds the results for one build.gradle file.
 type GradleReportSection struct {
 	FilePath        string
 	Dependencies    map[string]ExtendedDepInfo // Flat map after BFS resolution
@@ -56,7 +53,6 @@ type GradleReportSection struct {
 	TransitiveCount int                        // Count of transitive dependencies
 }
 
-// MavenPOM is the minimal structure parsed from a POM file.
 type MavenPOM struct {
 	XMLName        xml.Name `xml:"project"`
 	Parent         POMParent   `xml:"parent"`
@@ -72,14 +68,12 @@ type MavenPOM struct {
 	Version    string `xml:"version"`
 }
 
-// POMParent holds parent POM information.
 type POMParent struct {
 	GroupID    string `xml:"groupId"`
 	ArtifactID string `xml:"artifactId"`
 	Version    string `xml:"version"`
 }
 
-// POMDep represents a dependency entry in a POM.
 type POMDep struct {
 	GroupID    string `xml:"groupId"`
 	ArtifactID string `xml:"artifactId"`
@@ -88,13 +82,11 @@ type POMDep struct {
 	Optional   string `xml:"optional"`
 }
 
-// For BFS conflict resolution.
 type depState struct {
 	Version string
 	Depth   int
 }
 
-// queueItem is used in the BFS.
 type queueItem struct {
 	GroupArtifact string
 	Version       string
@@ -102,7 +94,6 @@ type queueItem struct {
 	ParentNode    *GradleDependencyNode
 }
 
-// For concurrent POM fetching.
 type fetchRequest struct {
 	GroupID    string
 	ArtifactID string
@@ -115,7 +106,6 @@ type fetchResult struct {
 	Err error
 }
 
-// LicenseData holds license info for HTML reporting.
 type LicenseData struct {
 	LicenseName string
 	ProjectURL  string
@@ -132,7 +122,6 @@ var (
 	pomRequests = make(chan fetchRequest, 50)
 	wgWorkers   sync.WaitGroup
 
-	// A simple SPDX license mapping (expand as needed)
 	spdxLicenseMap = map[string]struct {
 		Name     string
 		Copyleft bool
@@ -526,7 +515,7 @@ func isCopyleft(name string) bool {
 }
 
 // -------------------------------------------------------------------------------------
-// STEP 4: CONCURRENT POM FETCH & DISK CACHING
+// STEP 4: CONCURRENT POM FETCH & DISK CACHING (POM Fetch Functions)
 // -------------------------------------------------------------------------------------
 
 func concurrentFetchPOM(g, a, v string) (*MavenPOM, error) {
@@ -631,13 +620,16 @@ func fetchRemotePOM(g, a, v string) (*MavenPOM, error) {
 }
 
 func fetchPOMFromURL(url string) (*MavenPOM, error) {
+	fmt.Printf("Fetching URL: %s\n", url)
 	client := http.Client{Timeout: fetchTimeout}
 	resp, err := client.Get(url)
 	if err != nil {
+		fmt.Printf("Error fetching URL %s: %v\n", url, err)
 		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
+		fmt.Printf("Non-200 response for URL %s: HTTP %d\n", url, resp.StatusCode)
 		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
 	}
 	data, err := io.ReadAll(resp.Body)
@@ -870,85 +862,4 @@ func generateHTMLReport(sections []GradleReportSection) error {
 		return err
 	}
 	outputFile := filepath.Join(outDir, "dependency-license-report.html")
-	f, err := os.Create(outputFile)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	if err := tmpl.Execute(f, sections); err != nil {
-		return err
-	}
-	fmt.Printf("✅ License report generated at %s\n", outputFile)
-	return nil
-}
-
-// -------------------------------------------------------------------------------------
-// ADDITIONAL: PRINT PROGRESS REPORT TO CONSOLE
-// -------------------------------------------------------------------------------------
-
-func printConsoleReport(sections []GradleReportSection) {
-	fmt.Println("----- Console Dependency Report -----")
-	for _, sec := range sections {
-		fmt.Printf("File: %s\n", sec.FilePath)
-		fmt.Printf("Direct Dependencies: %d, Transitive: %d\n", len(sec.Dependencies), sec.TransitiveCount)
-		fmt.Println("Flat Dependencies:")
-		var keys []string
-		for k := range sec.Dependencies {
-			keys = append(keys, k)
-		}
-		sort.Strings(keys)
-		for _, k := range keys {
-			info := sec.Dependencies[k]
-			fmt.Printf("  %s -> %s (Parent: %s)\n", k, info.Display, info.Parent)
-		}
-		fmt.Println("Dependency Tree:")
-		for _, node := range sec.DependencyTree {
-			printTreeNode(node, 0)
-		}
-		fmt.Println("-------------------------------------")
-	}
-}
-
-func printTreeNode(node *GradleDependencyNode, indent int) {
-	prefix := strings.Repeat("  ", indent)
-	fmt.Printf("%s%s@%s (License: %s)\n", prefix, node.Name, node.Version, node.License)
-	for _, child := range node.Transitive {
-		printTreeNode(child, indent+1)
-	}
-}
-
-// -------------------------------------------------------------------------------------
-// MAIN FUNCTION
-// -------------------------------------------------------------------------------------
-
-func main() {
-	defer close(pomRequests)
-	defer wgWorkers.Wait()
-
-	fmt.Println("Starting dependency analysis...")
-	files, err := findBuildGradleFiles(".")
-	if err != nil {
-		fmt.Printf("Error scanning for build.gradle files: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("Found %d build.gradle file(s).\n", len(files))
-
-	sections, err := parseAllBuildGradleFiles(files)
-	if err != nil {
-		fmt.Printf("Error parsing build.gradle files: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Println("Starting transitive dependency resolution...")
-	buildTransitiveClosure(sections)
-
-	fmt.Println("Generating HTML report...")
-	if err := generateHTMLReport(sections); err != nil {
-		fmt.Printf("Error generating HTML report: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Println("Printing console report...")
-	printConsoleReport(sections)
-	fmt.Println("Analysis complete.")
-}
+	f, err := os.Create(
