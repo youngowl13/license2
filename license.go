@@ -21,8 +21,8 @@ import (
 // -------------------------------------------------------------------------------------
 
 // DepVersion holds two version strings:
-// - Display: Shown in the report's Version column
-// - Lookup:  Used for POM/License fetching
+// - Display: shown in the report's Version column
+// - Lookup:  used for POM/License fetching
 type DepVersion struct {
     Display string
     Lookup  string
@@ -216,270 +216,258 @@ var pomCache sync.Map // key = "group:artifact:version" => *MavenPOM
 
 // DepState tracks the chosen version & depth for each "group/artifact" we’ve encountered.
 type DepState struct {
-	Version string // final chosen version
-	Depth   int    // BFS depth (1 = direct, 2 = child of direct, etc.)
+    Version string // final chosen version
+    Depth   int    // BFS depth (1 = direct, 2 = child of direct, etc.)
 }
 
 // We'll store our BFS queue items here
 type queueItem struct {
-	GroupArtifact string // e.g. "androidx.appcompat/appcompat"
-	Version       string // e.g. "1.4.2"
-	Depth         int    // BFS depth
-	ParentGAV     string // immediate parent's "g:a:v" or "direct"
+    GroupArtifact string // e.g. "androidx.appcompat/appcompat"
+    Version       string // e.g. "1.4.2"
+    Depth         int    // BFS depth
+    ParentGAV     string // immediate parent's "g:a:v" or "direct"
 }
 
 func buildTransitiveClosure(sections []GradleReportSection) {
-	for i := range sections {
-		// We'll do BFS for each build.gradle’s direct dependencies
-		stateMap := make(map[string]DepState) // track best version & depth for each group/artifact
-		var queue []queueItem
+    for i := range sections {
+        // We'll do BFS for each build.gradle’s direct dependencies
+        stateMap := make(map[string]DepState) // track best version & depth for each group/artifact
+        var queue []queueItem
 
-		// Initialize queue with direct dependencies
-		for depKey, info := range sections[i].Dependencies {
-			q := queueItem{
-				GroupArtifact: depKey,
-				Version:       info.Lookup,
-				Depth:         1,
-				ParentGAV:     "direct",
-			}
-			stateMap[depKey] = DepState{Version: info.Lookup, Depth: 1}
-			queue = append(queue, q)
-		}
+        // Initialize queue with direct dependencies
+        for depKey, info := range sections[i].Dependencies {
+            q := queueItem{
+                GroupArtifact: depKey,
+                Version:       info.Lookup,
+                Depth:         1,
+                ParentGAV:     "direct",
+            }
+            stateMap[depKey] = DepState{Version: info.Lookup, Depth: 1}
+            queue = append(queue, q)
+        }
 
-		// BFS loop
-		for len(queue) > 0 {
-			// pop front
-			item := queue[0]
-			queue = queue[1:]
+        // BFS loop
+        for len(queue) > 0 {
+            // pop front
+            item := queue[0]
+            queue = queue[1:]
 
-			gid, aid := splitGA(item.GroupArtifact)
-			if gid == "" || aid == "" {
-				continue
-			}
+            gid, aid := splitGA(item.GroupArtifact)
+            if gid == "" || aid == "" {
+                continue
+            }
 
-			// fetch POM
-			pom, err := fetchAndParsePOM(gid, aid, item.Version)
-			if err != nil {
-				// skip
-				continue
-			}
+            // fetch POM
+            pom, err := fetchAndParsePOM(gid, aid, item.Version)
+            if err != nil {
+                // skip
+                continue
+            }
 
-			// gather managedVersions from <dependencyManagement> if present
-			managedVersions := parseManagedVersions(pom)
+            // gather managedVersions from <dependencyManagement> if present
+            managedVersions := parseManagedVersions(pom)
 
-			// For each child <dependency>, see if we should add it to BFS
-			for _, childDep := range pom.Dependencies {
-				if skipDependency(childDep.Scope, childDep.Optional) {
-					continue
-				}
-				childGA := childDep.GroupID + "/" + childDep.ArtifactID
-				childVersion := childDep.Version
-				// if childVersion is missing, check <dependencyManagement>
-				if childVersion == "" {
-					if mv, ok := managedVersions[childGA]; ok && mv != "" {
-						childVersion = mv
-					}
-				}
-				// if STILL empty, try parent's groupId/version if the child uses placeholder
-				// (some POMs omit <version>, relying on the parent's <version>)
-				if childVersion == "" {
-					childVersion = fallbackVersionFromParent(childDep.GroupID, childDep.ArtifactID, pom)
-				}
-				if childVersion == "" {
-					continue // no version found
-				}
+            // For each child <dependency>, see if we should add it to BFS
+            for _, childDep := range pom.Dependencies {
+                if skipDependency(childDep.Scope, childDep.Optional) {
+                    continue
+                }
+                childGA := childDep.GroupID + "/" + childDep.ArtifactID
+                childVersion := childDep.Version
+                // if childVersion is missing, check <dependencyManagement>
+                if childVersion == "" {
+                    if mv, ok := managedVersions[childGA]; ok && mv != "" {
+                        childVersion = mv
+                    }
+                }
+                // if STILL empty, try parent's groupId/version if the child uses placeholders
+                if childVersion == "" {
+                    childVersion = fallbackVersionFromParent(childDep.GroupID, childDep.ArtifactID, pom)
+                }
+                if childVersion == "" {
+                    continue // no version found
+                }
 
-				// Now apply "nearest-wins" version conflict resolution
-				childDepth := item.Depth + 1
-				curState, exists := stateMap[childGA]
-				if !exists {
-					// Not seen yet => store & enqueue
-					stateMap[childGA] = DepState{Version: childVersion, Depth: childDepth}
-					queue = append(queue, queueItem{
-						GroupArtifact: childGA,
-						Version:       childVersion,
-						Depth:         childDepth,
-						ParentGAV:     fmt.Sprintf("%s:%s", item.GroupArtifact, item.Version),
-					})
-				} else {
-					// We have seen this GA. If we discovered a shallower path, we override & re-queue
-					if childDepth < curState.Depth {
-						// override
-						stateMap[childGA] = DepState{Version: childVersion, Depth: childDepth}
-						queue = append(queue, queueItem{
-							GroupArtifact: childGA,
-							Version:       childVersion,
-							Depth:         childDepth,
-							ParentGAV:     fmt.Sprintf("%s:%s", item.GroupArtifact, item.Version),
-						})
-					}
-				}
-			}
-		}
+                // Now apply "nearest-wins" version conflict resolution
+                childDepth := item.Depth + 1
+                curState, exists := stateMap[childGA]
+                if !exists {
+                    // Not seen yet => store & enqueue
+                    stateMap[childGA] = DepState{Version: childVersion, Depth: childDepth}
+                    queue = append(queue, queueItem{
+                        GroupArtifact: childGA,
+                        Version:       childVersion,
+                        Depth:         childDepth,
+                        ParentGAV:     fmt.Sprintf("%s:%s", item.GroupArtifact, item.Version),
+                    })
+                } else {
+                    // We have seen this GA. If we discovered a shallower path, we override & re-queue
+                    if childDepth < curState.Depth {
+                        // override
+                        stateMap[childGA] = DepState{Version: childVersion, Depth: childDepth}
+                        queue = append(queue, queueItem{
+                            GroupArtifact: childGA,
+                            Version:       childVersion,
+                            Depth:         childDepth,
+                            ParentGAV:     fmt.Sprintf("%s:%s", item.GroupArtifact, item.Version),
+                        })
+                    }
+                }
+            }
+        }
 
-		// After BFS completes, we have final version for each GA. We'll store them in Dependencies map
-		// We also track parent for each discovered dependency. The BFS items track parent, so we need
-		// to re-run BFS or maintain a “parent map” as we go. Let’s maintain a separate parentMap:
-		parentMap := make(map[string]string) // "GA" -> "parentGAV"
-		// We'll do a BFS again, but this time purely to reconstruct parents (only storing first parent).
-		// (Alternatively, we could store the parent whenever we do queue = append(...) above.)
-		// Let's do it directly above. We'll store them in a local map as we process:
-		depMap := make(map[string]ExtendedDepInfo)
+        // After BFS completes, we have final version for each GA. We'll store them in a local map while also
+        // reconstructing immediate parent references. We'll do a second BFS pass to fill in the "Parent" fields.
 
-		// re-run BFS for parent reconstruction
-		visited2 := make(map[string]bool)
-		var queue2 []queueItem
+        depMap := make(map[string]ExtendedDepInfo)
+        var queue2 []queueItem
+        visited2 := make(map[string]bool)
 
-		// Initialize from direct
-		for depKey, info := range sections[i].Dependencies {
-			depMap[depKey] = ExtendedDepInfo{
-				DepVersion: info.DepVersion,
-				Parent:     "direct",
-			}
-			queue2 = append(queue2, queueItem{
-				GroupArtifact: depKey,
-				Version:       info.Lookup,
-				Depth:         1,
-				ParentGAV:     "direct",
-			})
-			visited2[fmt.Sprintf("%s@%s", depKey, info.Lookup)] = true
-		}
+        // Initialize from direct
+        for depKey, info := range sections[i].Dependencies {
+            depMap[depKey] = ExtendedDepInfo{
+                DepVersion: info.DepVersion,
+                Parent:     "direct",
+            }
+            queue2 = append(queue2, queueItem{
+                GroupArtifact: depKey,
+                Version:       info.Lookup,
+                Depth:         1,
+                ParentGAV:     "direct",
+            })
+            visited2[fmt.Sprintf("%s@%s", depKey, info.Lookup)] = true
+        }
 
-		for len(queue2) > 0 {
-			it := queue2[0]
-			queue2 = queue2[1:]
+        for len(queue2) > 0 {
+            it := queue2[0]
+            queue2 = queue2[1:]
 
-			gid, aid := splitGA(it.GroupArtifact)
-			pom, err := fetchAndParsePOM(gid, aid, it.Version)
-			if err != nil {
-				continue
-			}
+            gid, aid := splitGA(it.GroupArtifact)
+            pom, err := fetchAndParsePOM(gid, aid, it.Version)
+            if err != nil {
+                continue
+            }
 
-			managedVersions := parseManagedVersions(pom)
-			for _, cd := range pom.Dependencies {
-				if skipDependency(cd.Scope, cd.Optional) {
-					continue
-				}
-				childGA := cd.GroupID + "/" + cd.ArtifactID
-				// final version
-				childVersion := cd.Version
-				if childVersion == "" {
-					if mv, ok := managedVersions[childGA]; ok && mv != "" {
-						childVersion = mv
-					} else {
-						childVersion = fallbackVersionFromParent(cd.GroupID, cd.ArtifactID, pom)
-					}
-				}
-				if childVersion == "" {
-					continue
-				}
-				// see if BFS resolved a different version for that GA
-				final := stateMap[childGA]
-				if final.Version == "" {
-					continue
-				}
-				if final.Version != childVersion {
-					// BFS decided on a different version => use BFS version
-					childVersion = final.Version
-				}
-				key := childGA
+            managedVersions := parseManagedVersions(pom)
+            for _, cd := range pom.Dependencies {
+                if skipDependency(cd.Scope, cd.Optional) {
+                    continue
+                }
+                childGA := cd.GroupID + "/" + cd.ArtifactID
+                // final version from BFS
+                childVersion := cd.Version
+                if childVersion == "" {
+                    if mv, ok := managedVersions[childGA]; ok && mv != "" {
+                        childVersion = mv
+                    } else {
+                        childVersion = fallbackVersionFromParent(cd.GroupID, cd.ArtifactID, pom)
+                    }
+                }
+                if childVersion == "" {
+                    continue
+                }
+                // see if BFS decided on a different version
+                final := stateMap[childGA]
+                if final.Version == "" {
+                    continue
+                }
+                if final.Version != childVersion {
+                    childVersion = final.Version
+                }
+                key := childGA
 
-				// If not in depMap, add it
-				if _, exists := depMap[key]; !exists {
-					depMap[key] = ExtendedDepInfo{
-						DepVersion: DepVersion{
-							Display: childVersion,
-							Lookup:  childVersion,
-						},
-						Parent: fmt.Sprintf("%s:%s", it.GroupArtifact, it.Version),
-					}
-				}
+                // If not in depMap, add it with a parent reference
+                if _, exists := depMap[key]; !exists {
+                    depMap[key] = ExtendedDepInfo{
+                        DepVersion: DepVersion{
+                            Display: childVersion,
+                            Lookup:  childVersion,
+                        },
+                        Parent: fmt.Sprintf("%s:%s", it.GroupArtifact, it.Version),
+                    }
+                }
 
-				// If not visited, enqueue
-				visitKey := fmt.Sprintf("%s@%s", key, childVersion)
-				if !visited2[visitKey] {
-					visited2[visitKey] = true
-					queue2 = append(queue2, queueItem{
-						GroupArtifact: key,
-						Version:       childVersion,
-						Depth:         it.Depth + 1,
-						ParentGAV:     fmt.Sprintf("%s:%s", it.GroupArtifact, it.Version),
-					})
-				}
-			}
-		}
+                // If not visited, enqueue
+                visitKey := fmt.Sprintf("%s@%s", key, childVersion)
+                if !visited2[visitKey] {
+                    visited2[visitKey] = true
+                    queue2 = append(queue2, queueItem{
+                        GroupArtifact: key,
+                        Version:       childVersion,
+                        Depth:         it.Depth + 1,
+                        ParentGAV:     fmt.Sprintf("%s:%s", it.GroupArtifact, it.Version),
+                    })
+                }
+            }
+        }
 
-		// Now merge depMap back into sections[i].Dependencies
-		for k, v := range depMap {
-			sections[i].Dependencies[k] = v
-		}
+        // Now merge depMap back into sections[i].Dependencies
+        for k, v := range depMap {
+            sections[i].Dependencies[k] = v
+        }
 
-		// Calculate how many are transitive
-		directCount := 0
-		for _, v := range sections[i].Dependencies {
-			if v.Parent == "direct" {
-				directCount++
-			}
-		}
-		sections[i].TransitiveCount = len(sections[i].Dependencies) - directCount
-	}
+        // Calculate how many are transitive
+        directCount := 0
+        for _, v := range sections[i].Dependencies {
+            if v.Parent == "direct" {
+                directCount++
+            }
+        }
+        sections[i].TransitiveCount = len(sections[i].Dependencies) - directCount
+    }
 }
 
 // skipDependency returns true if we should skip test/provided/optional dependencies.
 func skipDependency(scope, optional string) bool {
-	s := strings.ToLower(strings.TrimSpace(scope))
-	if s == "test" || s == "provided" || s == "system" {
-		return true
-	}
-	o := strings.ToLower(strings.TrimSpace(optional))
-	if o == "true" {
-		return true
-	}
-	return false
+    s := strings.ToLower(strings.TrimSpace(scope))
+    if s == "test" || s == "provided" || s == "system" {
+        return true
+    }
+    o := strings.ToLower(strings.TrimSpace(optional))
+    if o == "true" {
+        return true
+    }
+    return false
 }
 
 // parseManagedVersions creates a map of "group/artifact" -> version from <dependencyManagement>.
 func parseManagedVersions(pom *MavenPOM) map[string]string {
-	result := make(map[string]string)
-	for _, d := range pom.DependencyMgmt.Dependencies {
-		if skipDependency(d.Scope, d.Optional) {
-			continue
-		}
-		if d.Version == "" {
-			continue
-		}
-		ga := d.GroupID + "/" + d.ArtifactID
-		result[ga] = d.Version
-	}
-	return result
+    result := make(map[string]string)
+    for _, d := range pom.DependencyMgmt.Dependencies {
+        if skipDependency(d.Scope, d.Optional) {
+            continue
+        }
+        if d.Version == "" {
+            continue
+        }
+        ga := d.GroupID + "/" + d.ArtifactID
+        result[ga] = d.Version
+    }
+    return result
 }
 
 // fallbackVersionFromParent tries to see if the child matches the POM’s <groupId> or the parent's groupId
 // if the child simply omitted <version>. This is very naive parent inheritance logic.
 func fallbackVersionFromParent(childGroup, childArtifact string, pom *MavenPOM) string {
-	// If child groupId matches pom.groupId or parent's groupId, we might guess the parent's version
-	// This is extremely naive. Real Maven logic is more involved.
-	parentGroup := pom.Parent.GroupID
-	parentVersion := pom.Parent.Version
+    parentGroup := pom.Parent.GroupID
+    parentVersion := pom.Parent.Version
 
-	// If childGroup == pom.GroupID && pom.Version != "" => that might be the version
-	if childGroup == pom.GroupID && pom.Version != "" {
-		return pom.Version
-	}
-	// else if childGroup == parentGroup => parent's version
-	if childGroup == parentGroup && parentVersion != "" {
-		return parentVersion
-	}
-	return ""
+    if childGroup == pom.GroupID && pom.Version != "" {
+        return pom.Version
+    }
+    if childGroup == parentGroup && parentVersion != "" {
+        return parentVersion
+    }
+    return ""
 }
 
 // splitGA splits "group/artifact" into (group, artifact).
 func splitGA(ga string) (string, string) {
-	parts := strings.Split(ga, "/")
-	if len(parts) != 2 {
-		return "", ""
-	}
-	return parts[0], parts[1]
+    parts := strings.Split(ga, "/")
+    if len(parts) != 2 {
+        return "", ""
+    }
+    return parts[0], parts[1]
 }
 
 // -------------------------------------------------------------------------------------
@@ -488,121 +476,121 @@ func splitGA(ga string) (string, string) {
 
 // fetchAndParsePOM fetches the POM from either Maven Central or Google, plus checks <parent> if needed.
 func fetchAndParsePOM(groupID, artifactID, version string) (*MavenPOM, error) {
-	// If we have it in cache, return
-	key := fmt.Sprintf("%s:%s:%s", groupID, artifactID, version)
-	if cached, ok := pomCache.Load(key); ok {
-		return cached.(*MavenPOM), nil
-	}
+    // If we have it in cache, return
+    key := fmt.Sprintf("%s:%s:%s", groupID, artifactID, version)
+    if cached, ok := pomCache.Load(key); ok {
+        return cached.(*MavenPOM), nil
+    }
 
-	pom, err := retrievePOM(groupID, artifactID, version)
-	if err != nil {
-		return nil, err
-	}
+    pom, err := retrievePOM(groupID, artifactID, version)
+    if err != nil {
+        return nil, err
+    }
 
-	// Attempt to fill the local groupId/version from <parent> if missing
-	if pom.GroupID == "" {
-		pom.GroupID = pom.Parent.GroupID
-	}
-	if pom.Version == "" {
-		pom.Version = pom.Parent.Version
-	}
+    // Attempt to fill the local groupId/version from <parent> if missing
+    if pom.GroupID == "" {
+        pom.GroupID = pom.Parent.GroupID
+    }
+    if pom.Version == "" {
+        pom.Version = pom.Parent.Version
+    }
 
-	// If the POM has a parent, we parse that parent's POM for <dependencyManagement> too.
-	// Then we can merge. This is a partial approach.
-	if pom.Parent.GroupID != "" && pom.Parent.ArtifactID != "" && pom.Parent.Version != "" {
-		parentKey := fmt.Sprintf("%s:%s:%s", pom.Parent.GroupID, pom.Parent.ArtifactID, pom.Parent.Version)
-		parentPOM, ok := pomCache.Load(parentKey)
-		var parent *MavenPOM
-		if !ok {
-			// fetch parent's POM
-			parent, _ = retrievePOM(pom.Parent.GroupID, pom.Parent.ArtifactID, pom.Parent.Version)
-			if parent != nil {
-				// store
-				pomCache.Store(parentKey, parent)
-			}
-		} else {
-			parent = parentPOM.(*MavenPOM)
-		}
-		// If we found a parent, merge parent's <dependencyManagement> into this POM's <dependencyManagement>
-		if parent != nil {
-			pom.DependencyMgmt.Dependencies = mergeDepMgmt(parent.DependencyMgmt.Dependencies, pom.DependencyMgmt.Dependencies)
-			// If after that we still have no groupId, version, use parent's
-			if pom.GroupID == "" {
-				pom.GroupID = parent.GroupID
-			}
-			if pom.Version == "" {
-				pom.Version = parent.Version
-			}
-		}
-	}
+    // If the POM has a parent, we parse that parent's POM for <dependencyManagement> too.
+    // Then we can merge. This is a partial approach.
+    if pom.Parent.GroupID != "" && pom.Parent.ArtifactID != "" && pom.Parent.Version != "" {
+        parentKey := fmt.Sprintf("%s:%s:%s", pom.Parent.GroupID, pom.Parent.ArtifactID, pom.Parent.Version)
+        parentPOM, ok := pomCache.Load(parentKey)
+        var parent *MavenPOM
+        if !ok {
+            // fetch parent's POM
+            parent, _ = retrievePOM(pom.Parent.GroupID, pom.Parent.ArtifactID, pom.Parent.Version)
+            if parent != nil {
+                // store
+                pomCache.Store(parentKey, parent)
+            }
+        } else {
+            parent = parentPOM.(*MavenPOM)
+        }
+        // If we found a parent, merge parent's <dependencyManagement> into this POM's <dependencyManagement>
+        if parent != nil {
+            pom.DependencyMgmt.Dependencies = mergeDepMgmt(parent.DependencyMgmt.Dependencies, pom.DependencyMgmt.Dependencies)
+            // If after that we still have no groupId, version, use parent's
+            if pom.GroupID == "" {
+                pom.GroupID = parent.GroupID
+            }
+            if pom.Version == "" {
+                pom.Version = parent.Version
+            }
+        }
+    }
 
-	pomCache.Store(key, pom)
-	return pom, nil
+    pomCache.Store(key, pom)
+    return pom, nil
 }
 
 // retrievePOM tries Maven Central then Google Maven
 func retrievePOM(groupID, artifactID, version string) (*MavenPOM, error) {
-	groupPath := strings.ReplaceAll(groupID, ".", "/")
-	centralURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom",
-		groupPath, artifactID, version, artifactID, version)
-	googleURL := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom",
-		groupPath, artifactID, version, artifactID, version)
+    groupPath := strings.ReplaceAll(groupID, ".", "/")
+    centralURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom",
+        groupPath, artifactID, version, artifactID, version)
+    googleURL := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom",
+        groupPath, artifactID, version, artifactID, version)
 
-	if pom, err := fetchPOMFromURL(centralURL); err == nil {
-		return pom, nil
-	}
-	if pom, err := fetchPOMFromURL(googleURL); err == nil {
-		return pom, nil
-	}
-	return nil, fmt.Errorf("unable to fetch POM for %s:%s:%s", groupID, artifactID, version)
+    if pom, err := fetchPOMFromURL(centralURL); err == nil {
+        return pom, nil
+    }
+    if pom, err := fetchPOMFromURL(googleURL); err == nil {
+        return pom, nil
+    }
+    return nil, fmt.Errorf("unable to fetch POM for %s:%s:%s", groupID, artifactID, version)
 }
 
 // fetchPOMFromURL fetches and unmarshals a Maven POM from a given URL
 func fetchPOMFromURL(url string) (*MavenPOM, error) {
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, fmt.Errorf("GET error for %s: %v", url, err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
-	}
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-	var pom MavenPOM
-	dec := xml.NewDecoder(bytes.NewReader(data))
-	dec.Strict = false
-	if err := dec.Decode(&pom); err != nil {
-		return nil, fmt.Errorf("XML decode error: %v", err)
-	}
-	return &pom, nil
+    resp, err := http.Get(url)
+    if err != nil {
+        return nil, fmt.Errorf("GET error for %s: %v", url, err)
+    }
+    defer resp.Body.Close()
+    if resp.StatusCode != http.StatusOK {
+        return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
+    }
+    data, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return nil, err
+    }
+    var pom MavenPOM
+    dec := xml.NewDecoder(bytes.NewReader(data))
+    dec.Strict = false
+    if err := dec.Decode(&pom); err != nil {
+        return nil, fmt.Errorf("XML decode error: %v", err)
+    }
+    return &pom, nil
 }
 
-// mergeDepMgmt merges parent’s <dependencyManagement> entries with child’s. Child entries override parent’s if same G/A.
+// mergeDepMgmt merges parent's <dependencyManagement> entries with child's. Child entries override parent's if same G/A.
 func mergeDepMgmt(parent, child []POMDep) []POMDep {
-	// build a map from parent's
-	outMap := make(map[string]POMDep)
-	for _, d := range parent {
-		key := d.GroupID + ":" + d.ArtifactID
-		outMap[key] = d
-	}
-	// child overrides
-	for _, d := range child {
-		key := d.GroupID + ":" + d.ArtifactID
-		outMap[key] = d
-	}
-	// convert back to slice
-	var merged []POMDep
-	for _, val := range outMap {
-		merged = append(merged, val)
-	}
-	// sort for stable output
-	sort.Slice(merged, func(i, j int) bool {
-		return merged[i].GroupID < merged[j].GroupID
-	})
-	return merged
+    // build a map from parent's
+    outMap := make(map[string]POMDep)
+    for _, d := range parent {
+        key := d.GroupID + ":" + d.ArtifactID
+        outMap[key] = d
+    }
+    // child overrides
+    for _, d := range child {
+        key := d.GroupID + ":" + d.ArtifactID
+        outMap[key] = d
+    }
+    // convert back to slice
+    var merged []POMDep
+    for _, val := range outMap {
+        merged = append(merged, val)
+    }
+    // sort for stable output
+    sort.Slice(merged, func(i, j int) bool {
+        return merged[i].GroupID < merged[j].GroupID
+    })
+    return merged
 }
 
 // -------------------------------------------------------------------------------------
@@ -611,60 +599,60 @@ func mergeDepMgmt(parent, child []POMDep) []POMDep {
 
 // getLicenseInfo returns (licenseName, projectURL, POMFileURL).
 func getLicenseInfo(groupID, artifactID, version string) (string, string, string) {
-	// Try to fetch the POM (cached or live). If fail => unknown
-	pom, err := fetchAndParsePOM(groupID, artifactID, version)
-	if err != nil || pom == nil {
-		return "Unknown", fmt.Sprintf("https://www.google.com/search?q=%s+%s+%s+license", groupID, artifactID, version), ""
-	}
-	// We'll guess that the best "project URL" is the location from Maven Central if found. 
-	// This is an approximation:
-	groupPath := strings.ReplaceAll(groupID, ".", "/")
-	centralURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/", groupPath, artifactID, version)
-	pomURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom",
-		groupPath, artifactID, version, artifactID, version)
-	licenseName := "Unknown"
-	if len(pom.Licenses) > 0 {
-		licenseName = pom.Licenses[0].Name
-	}
-	return licenseName, centralURL, pomURL
+    // Try to fetch the POM (cached or live). If fail => unknown
+    pom, err := fetchAndParsePOM(groupID, artifactID, version)
+    if err != nil || pom == nil {
+        return "Unknown", fmt.Sprintf("https://www.google.com/search?q=%s+%s+%s+license", groupID, artifactID, version), ""
+    }
+    // We'll guess that the best "project URL" is the location from Maven Central if found.
+    groupPath := strings.ReplaceAll(groupID, ".", "/")
+    centralURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/", groupPath, artifactID, version)
+    pomURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom",
+        groupPath, artifactID, version, artifactID, version)
+
+    licenseName := "Unknown"
+    if len(pom.Licenses) > 0 {
+        licenseName = pom.Licenses[0].Name
+    }
+    return licenseName, centralURL, pomURL
 }
 
 // isCopyleft checks for known copyleft license keywords
 func isCopyleft(licenseName string) bool {
-	copyleftKeywords := []string{
-		"GPL", "LGPL", "AGPL", "CC BY-SA", "CC-BY-SA", "MPL", "EPL", "CPL",
-		"CDDL", "EUPL", "Affero", "OSL", "CeCILL",
-		"GNU General Public License",
-		"GNU Lesser General Public License",
-		"Mozilla Public License",
-		"Common Development and Distribution License",
-		"Eclipse Public License",
-		"Common Public License",
-		"European Union Public License",
-		"Open Software License",
-	}
-	up := strings.ToUpper(licenseName)
-	for _, kw := range copyleftKeywords {
-		if strings.Contains(up, strings.ToUpper(kw)) {
-			return true
-		}
-	}
-	return false
+    copyleftKeywords := []string{
+        "GPL", "LGPL", "AGPL", "CC BY-SA", "CC-BY-SA", "MPL", "EPL", "CPL",
+        "CDDL", "EUPL", "Affero", "OSL", "CeCILL",
+        "GNU General Public License",
+        "GNU Lesser General Public License",
+        "Mozilla Public License",
+        "Common Development and Distribution License",
+        "Eclipse Public License",
+        "Common Public License",
+        "European Union Public License",
+        "Open Software License",
+    }
+    up := strings.ToUpper(licenseName)
+    for _, kw := range copyleftKeywords {
+        if strings.Contains(up, strings.ToUpper(kw)) {
+            return true
+        }
+    }
+    return false
 }
 
 // getLicenseInfoWrapper returns a single struct for template usage
 func getLicenseInfoWrapper(dep, version string) LicenseData {
-	parts := strings.Split(dep, "/")
-	if len(parts) != 2 {
-		return LicenseData{LicenseName: "Unknown"}
-	}
-	g, a := parts[0], parts[1]
-	licName, projURL, pomURL := getLicenseInfo(g, a, version)
-	return LicenseData{
-		LicenseName: licName,
-		ProjectURL:  projURL,
-		PomURL:      pomURL,
-	}
+    parts := strings.Split(dep, "/")
+    if len(parts) != 2 {
+        return LicenseData{LicenseName: "Unknown"}
+    }
+    g, a := parts[0], parts[1]
+    licName, projURL, pomURL := getLicenseInfo(g, a, version)
+    return LicenseData{
+        LicenseName: licName,
+        ProjectURL:  projURL,
+        PomURL:      pomURL,
+    }
 }
 
 // -------------------------------------------------------------------------------------
@@ -672,14 +660,14 @@ func getLicenseInfoWrapper(dep, version string) LicenseData {
 // -------------------------------------------------------------------------------------
 
 func generateHTMLReport(sections []GradleReportSection) error {
-	outputDir := "./license-checker"
-	if _, err := os.Stat(outputDir); os.IsNotExist(err) {
-		if err := os.Mkdir(outputDir, 0755); err != nil {
-			return fmt.Errorf("error creating output directory: %v", err)
-		}
-	}
+    outputDir := "./license-checker"
+    if _, err := os.Stat(outputDir); os.IsNotExist(err) {
+        if err := os.Mkdir(outputDir, 0755); err != nil {
+            return fmt.Errorf("error creating output directory: %v", err)
+        }
+    }
 
-	const tmplText = `<!DOCTYPE html>
+    const tmplText = `<!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
@@ -755,27 +743,27 @@ func generateHTMLReport(sections []GradleReportSection) error {
 </body>
 </html>`
 
-	tmpl, err := template.New("report").Funcs(template.FuncMap{
-		"getLicenseInfoWrapper": getLicenseInfoWrapper,
-		"isCopyleft":            isCopyleft,
-	}).Parse(tmplText)
-	if err != nil {
-		return fmt.Errorf("template parse error: %v", err)
-	}
+    tmpl, err := template.New("report").Funcs(template.FuncMap{
+        "getLicenseInfoWrapper": getLicenseInfoWrapper,
+        "isCopyleft":            isCopyleft,
+    }).Parse(tmplText)
+    if err != nil {
+        return fmt.Errorf("template parse error: %v", err)
+    }
 
-	reportPath := filepath.Join(outputDir, "dependency-license-report.html")
-	file, err := os.Create(reportPath)
-	if err != nil {
-		return fmt.Errorf("error creating report file: %v", err)
-	}
-	defer file.Close()
+    reportPath := filepath.Join(outputDir, "dependency-license-report.html")
+    file, err := os.Create(reportPath)
+    if err != nil {
+        return fmt.Errorf("error creating report file: %v", err)
+    }
+    defer file.Close()
 
-	if err := tmpl.Execute(file, sections); err != nil {
-		return fmt.Errorf("error executing template: %v", err)
-	}
+    if err := tmpl.Execute(file, sections); err != nil {
+        return fmt.Errorf("error executing template: %v", err)
+    }
 
-	fmt.Printf("✅ License report generated at %s\n", reportPath)
-	return nil
+    fmt.Printf("✅ License report generated at %s\n", reportPath)
+    return nil
 }
 
 // -------------------------------------------------------------------------------------
@@ -783,24 +771,24 @@ func generateHTMLReport(sections []GradleReportSection) error {
 // -------------------------------------------------------------------------------------
 
 func main() {
-	files, err := findBuildGradleFiles(".")
-	if err != nil {
-		fmt.Printf("Error finding build.gradle files: %v\n", err)
-		os.Exit(1)
-	}
-	fmt.Printf("Found %d build.gradle file(s).\n", len(files))
+    files, err := findBuildGradleFiles(".")
+    if err != nil {
+        fmt.Printf("Error finding build.gradle files: %v\n", err)
+        os.Exit(1)
+    }
+    fmt.Printf("Found %d build.gradle file(s).\n", len(files))
 
-	sections, err := parseAllBuildGradleFiles(files)
-	if err != nil {
-		fmt.Printf("Error parsing build.gradle files: %v\n", err)
-		os.Exit(1)
-	}
+    sections, err := parseAllBuildGradleFiles(files)
+    if err != nil {
+        fmt.Printf("Error parsing build.gradle files: %v\n", err)
+        os.Exit(1)
+    }
 
-	// Build the full transitive closure with BFS + nearest-wins + parent POM logic
-	buildTransitiveClosure(sections)
+    // Build the full transitive closure with BFS + nearest-wins + parent POM logic
+    buildTransitiveClosure(sections)
 
-	if err := generateHTMLReport(sections); err != nil {
-		fmt.Printf("Error generating HTML report: %v\n", err)
-		os.Exit(1)
-	}
+    if err := generateHTMLReport(sections); err != nil {
+        fmt.Printf("Error generating HTML report: %v\n", err)
+        os.Exit(1)
+    }
 }
