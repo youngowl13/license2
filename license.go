@@ -132,6 +132,7 @@ var (
 	pomRequests = make(chan fetchRequest, 50)
 	wgWorkers   sync.WaitGroup
 
+	// A simple SPDX license mapping (expand as needed)
 	spdxLicenseMap = map[string]struct {
 		Name     string
 		Copyleft bool
@@ -156,7 +157,7 @@ var (
 func pomFetchWorker() {
 	defer wgWorkers.Done()
 	for req := range pomRequests {
-		fmt.Printf("Worker: Fetching POM for %s:%s:%s\n", req.GroupID, req.ArtifactID, req.Version)
+		fmt.Printf("Worker: Fetching POM for %s:%s:%s at %s\n", req.GroupID, req.ArtifactID, req.Version, time.Now().Format(time.RFC3339))
 		pom, err := retrieveOrLoadPOM(req.GroupID, req.ArtifactID, req.Version)
 		if err != nil {
 			fmt.Printf("⚠️ Error in worker fetching POM for %s:%s:%s: %v\n", req.GroupID, req.ArtifactID, req.Version, err)
@@ -305,14 +306,14 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 		for len(queue) > 0 {
 			it := queue[0]
 			queue = queue[1:]
-			fmt.Printf("BFS: Processing dependency %s (depth %d)\n", it.GroupArtifact, it.Depth)
+			fmt.Printf("BFS: Processing dependency %s (depth %d) at %s\n", it.GroupArtifact, it.Depth, time.Now().Format(time.RFC3339))
 			gid, aid := splitGA(it.GroupArtifact)
 			if gid == "" || aid == "" {
 				continue
 			}
 			pom, err := concurrentFetchPOM(gid, aid, it.Version)
 			if err != nil || pom == nil {
-				fmt.Printf("BFS: Skipping %s:%s:%s due to error.\n", gid, aid, it.Version)
+				fmt.Printf("BFS: Skipping %s:%s:%s due to error at %s.\n", gid, aid, it.Version, time.Now().Format(time.RFC3339))
 				continue
 			}
 			if it.ParentNode != nil {
@@ -360,7 +361,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 						Depth:         childDepth,
 						ParentNode:    childNode,
 					})
-					fmt.Printf("BFS: Added %s (depth %d)\n", childGA, childDepth)
+					fmt.Printf("BFS: Added %s (depth %d) at %s\n", childGA, childDepth, time.Now().Format(time.RFC3339))
 				} else {
 					if childDepth < curSt.Depth {
 						stateMap[childGA] = depState{Version: cv, Depth: childDepth}
@@ -385,7 +386,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 							Depth:         childDepth,
 							ParentNode:    childNode,
 						})
-						fmt.Printf("BFS: Updated %s with shallower depth %d\n", childGA, childDepth)
+						fmt.Printf("BFS: Updated %s with shallower depth %d at %s\n", childGA, childDepth, time.Now().Format(time.RFC3339))
 					}
 				}
 			}
@@ -619,27 +620,27 @@ func fetchRemotePOM(g, a, v string) (*MavenPOM, error) {
 	urlCentral := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
 	urlGoogle := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
 	if pm, err := fetchPOMFromURL(urlCentral); err == nil {
-		fmt.Printf("Fetched POM from Maven Central for %s:%s:%s\n", g, a, v)
+		fmt.Printf("Fetched POM from Maven Central for %s:%s:%s at %s\n", g, a, v, time.Now().Format(time.RFC3339))
 		return pm, nil
 	}
 	if pm, err := fetchPOMFromURL(urlGoogle); err == nil {
-		fmt.Printf("Fetched POM from Google Maven for %s:%s:%s\n", g, a, v)
+		fmt.Printf("Fetched POM from Google Maven for %s:%s:%s at %s\n", g, a, v, time.Now().Format(time.RFC3339))
 		return pm, nil
 	}
 	return nil, fmt.Errorf("could not fetch remote POM for %s:%s:%s", g, a, v)
 }
 
 func fetchPOMFromURL(url string) (*MavenPOM, error) {
-	fmt.Printf("Fetching URL: %s\n", url)
+	fmt.Printf("DEBUG: Starting HTTP request to %s at %s\n", url, time.Now().Format(time.RFC3339))
 	client := http.Client{Timeout: fetchTimeout}
 	resp, err := client.Get(url)
 	if err != nil {
-		fmt.Printf("Error fetching URL %s: %v\n", url, err)
+		fmt.Printf("DEBUG: Error during HTTP GET for %s: %v\n", url, err)
 		return nil, err
 	}
 	defer resp.Body.Close()
+	fmt.Printf("DEBUG: HTTP GET for %s returned status %d at %s\n", url, resp.StatusCode, time.Now().Format(time.RFC3339))
 	if resp.StatusCode != 200 {
-		fmt.Printf("Non-200 response for URL %s: HTTP %d\n", url, resp.StatusCode)
 		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
 	}
 	data, err := io.ReadAll(resp.Body)
