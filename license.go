@@ -2,7 +2,6 @@ package main
 
 import (
 	"bytes"
-	"context"
 	"encoding/xml"
 	"fmt"
 	"html/template"
@@ -33,13 +32,13 @@ const (
 // DATA STRUCTURES
 // -------------------------------------------------------------------------------------
 
-// GradleDependencyNode represents a node in the dependency tree.
+// GradleDependencyNode represents one node in the dependency tree.
 type GradleDependencyNode struct {
 	Name       string
 	Version    string
 	License    string
 	Copyleft   bool
-	Parent     string // "direct" for direct dependencies, or parent's GAV for transitive ones.
+	Parent     string
 	Transitive []*GradleDependencyNode
 }
 
@@ -58,7 +57,7 @@ type GradleReportSection struct {
 	TransitiveCount int                        // Count of transitive dependencies
 }
 
-// MavenPOM is the minimal structure parsed from a POM file.
+// MavenPOM is the minimal structure we parse from a POM file.
 type MavenPOM struct {
 	XMLName        xml.Name `xml:"project"`
 	Parent         POMParent   `xml:"parent"`
@@ -74,7 +73,7 @@ type MavenPOM struct {
 	Version    string `xml:"version"`
 }
 
-// POMParent holds information about a POM's parent.
+// POMParent holds parent POM information.
 type POMParent struct {
 	GroupID    string `xml:"groupId"`
 	ArtifactID string `xml:"artifactId"`
@@ -130,7 +129,7 @@ type LicenseData struct {
 
 var (
 	pomCache    sync.Map // key = "group:artifact:version" -> *MavenPOM
-	parentVisit sync.Map // for detecting cycles in parent POMs
+	parentVisit sync.Map // to detect cycles in parent resolution
 	pomRequests = make(chan fetchRequest, 50)
 	wgWorkers   sync.WaitGroup
 
@@ -159,19 +158,19 @@ var (
 func init() {
 	// Ensure the local POM cache directory exists.
 	_ = os.MkdirAll(localPOMCacheDir, 0755)
-	// Start worker goroutines.
+	// Start pomWorkerCount concurrent workers.
 	wgWorkers.Add(pomWorkerCount)
 	for i := 0; i < pomWorkerCount; i++ {
 		go pomFetchWorker()
 	}
 }
 
-// pomFetchWorker processes fetchRequests from the pomRequests channel concurrently.
+// pomFetchWorker processes fetchRequests from the pomRequests channel.
 func pomFetchWorker() {
 	defer wgWorkers.Done()
 	for req := range pomRequests {
 		pom, err := retrieveOrLoadPOM(req.GroupID, req.ArtifactID, req.Version)
-		// Log errors but continue.
+		// Log errors gracefully.
 		if err != nil {
 			fmt.Printf("⚠️ Error fetching POM for %s:%s:%s: %v\n", req.GroupID, req.ArtifactID, req.Version, err)
 		}
@@ -180,7 +179,7 @@ func pomFetchWorker() {
 }
 
 // -------------------------------------------------------------------------------------
-// STEP 1: FIND & PARSE build.gradle FILES
+// STEP 1: FIND AND PARSE build.gradle FILES
 // -------------------------------------------------------------------------------------
 
 func findBuildGradleFiles(root string) ([]string, error) {
@@ -542,7 +541,7 @@ func isCopyleft(name string) bool {
 }
 
 // -------------------------------------------------------------------------------------
-// STEP 4: CONCURRENT POM FETCH + DISK CACHING
+// STEP 4: CONCURRENT POM FETCH & DISK CACHING
 // -------------------------------------------------------------------------------------
 
 func concurrentFetchPOM(g, a, v string) (*MavenPOM, error) {
@@ -905,8 +904,6 @@ func generateHTMLReport(sections []GradleReportSection) error {
 // -------------------------------------------------------------------------------------
 
 func main() {
-	// Optionally, you can set an overall context timeout here.
-	// For simplicity, we'll omit passing it into our functions.
 	defer close(pomRequests)
 	defer wgWorkers.Wait()
 
@@ -917,7 +914,7 @@ func main() {
 	}
 	fmt.Printf("Found %d build.gradle file(s).\n", len(files))
 
-	sections, err := parseAllBuildGradleFiles(".")
+	sections, err := parseAllBuildGradleFiles(files)
 	if err != nil {
 		fmt.Printf("Error parsing build.gradle files: %v\n", err)
 		os.Exit(1)
