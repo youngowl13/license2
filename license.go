@@ -21,9 +21,9 @@ import (
 // -------------------------------------------------------------------------------------
 
 const (
-	localPOMCacheDir = ".pom-cache"         // Directory for disk caching of POMs
-	pomWorkerCount   = 10                   // Number of concurrent POM fetch workers
-	// No limit on parent POM depth now (we remove any maxParentDepth limitation)
+	localPOMCacheDir = ".pom-cache"     // Directory for disk caching of POMs
+	pomWorkerCount   = 10               // Number of concurrent POM fetch workers
+	// No limit on parent POM depth now
 	fetchTimeout = 30 * time.Second // HTTP request timeout
 )
 
@@ -37,7 +37,7 @@ var (
 	pomRequests = make(chan fetchRequest, 50)
 	wgWorkers   sync.WaitGroup
 
-	// channelOpen indicates if pomRequests is still open.
+	// channelOpen indicates if pomRequests channel is still open.
 	channelOpen  = true
 	channelMutex sync.Mutex
 
@@ -68,12 +68,11 @@ type GradleDependencyNode struct {
 	Version    string
 	License    string
 	Copyleft   bool
-	Parent     string // "direct" or parent's GAV for transitive dependencies.
+	Parent     string // "direct" for direct dependencies or parent's GAV for transitive dependencies.
 	Transitive []*GradleDependencyNode
 }
 
 // ExtendedDepInfo holds info for the flat dependency table.
-// Now it also includes precomputed license information.
 type ExtendedDepInfo struct {
 	Display           string // What to display ("version not available" if not provided in file)
 	Lookup            string // The version as parsed from file (may be "unknown")
@@ -86,9 +85,13 @@ type ExtendedDepInfo struct {
 // GradleReportSection holds results for one build.gradle file.
 type GradleReportSection struct {
 	FilePath        string
-	Dependencies    map[string]ExtendedDepInfo // Flat map after BFS resolution (will include transitive deps)
+	Dependencies    map[string]ExtendedDepInfo // Flat map after BFS resolution (includes transitive deps)
 	DependencyTree  []*GradleDependencyNode    // Hierarchical dependency tree
-	TransitiveCount int                        // Count of transitive dependencies
+	TransitiveCount int                        // Total transitive dependencies (tree total minus direct)
+	DirectCount     int                        // Count of direct dependencies
+	IndirectCount   int                        // Count of indirect (transitive) dependencies
+	CopyleftCount   int                        // Count of dependencies with copyleft license
+	UnknownCount    int                        // Count of dependencies with unknown license
 }
 
 // MavenPOM represents the minimal structure parsed from a POM file.
@@ -343,7 +346,7 @@ func fetchLatestVersionFromURL(url string) (string, error) {
 }
 
 // -------------------------------------------------------------------------------------
-// STEP 2: BFS + MULTI-LEVEL PARENT RESOLUTION (No limitation on depth)
+// STEP 2: BFS + MULTI-LEVEL PARENT RESOLUTION (No depth limit)
 // -------------------------------------------------------------------------------------
 
 func buildTransitiveClosure(sections []GradleReportSection) {
@@ -479,7 +482,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 				}
 			}
 		}
-		// Now update the flat dependency map with all dependencies from the tree.
+		// Populate the flat dependency map with all dependencies from the tree.
 		for _, rn := range rootNodes {
 			fillDepMap(rn, sec.Dependencies)
 		}
@@ -489,7 +492,13 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 		for _, rn := range rootNodes {
 			total += countNodes(rn)
 		}
-		direct := len(rootNodes)
+		direct := 0
+		// Count direct ones: those whose ExtendedDepInfo.Parent == "direct"
+		for _, info := range sec.Dependencies {
+			if info.Parent == "direct" {
+				direct++
+			}
+		}
 		sec.TransitiveCount = total - direct
 		// For dependencies that did not have literal version info in the file, mark display as "version not available"
 		for key, info := range sec.Dependencies {
@@ -498,6 +507,26 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 				sec.Dependencies[key] = info
 			}
 		}
+		// Compute summary metrics: direct, indirect, copyleft, unknown
+		var directCount, indirectCount, copyleftCount, unknownCount int
+		for _, info := range sec.Dependencies {
+			if info.Parent == "direct" {
+				directCount++
+			} else {
+				indirectCount++
+			}
+			if isCopyleft(info.License) {
+				copyleftCount++
+			}
+			if info.License == "Unknown" {
+				unknownCount++
+			}
+		}
+		sec.DirectCount = directCount
+		sec.IndirectCount = indirectCount
+		sec.CopyleftCount = copyleftCount
+		sec.UnknownCount = unknownCount
+
 		fmt.Printf("Finished processing %s: %d direct, %d transitive dependencies found.\n", sec.FilePath, len(sec.Dependencies), sec.TransitiveCount)
 	}
 }
@@ -562,9 +591,8 @@ func countNodes(n *GradleDependencyNode) int {
 	return count
 }
 
-// fillDepMap recursively adds the node and all its transitive children into depMap.
 func fillDepMap(n *GradleDependencyNode, depMap map[string]ExtendedDepInfo) {
-	// If the dependency is already present, update it.
+	// Update (or add) this node to the flat map.
 	if info, exists := depMap[n.Name]; exists {
 		info.Display = n.Version
 		info.Lookup = n.Version
@@ -869,7 +897,7 @@ func precomputeLicenseInfo(sections []GradleReportSection) {
 				continue
 			}
 			g, a := parts[0], parts[1]
-			// If version was unresolved in the file, mark as "version not available" and use Google search.
+			// If version was not provided in the file, mark as "version not available" and use a Google search.
 			if strings.Contains(info.Lookup, "${") || strings.ToLower(info.Lookup) == "unknown" {
 				info.License = "Unknown"
 				info.LicenseProjectURL = fmt.Sprintf("https://www.google.com/search?q=%s+%s+license", g, a)
@@ -963,10 +991,14 @@ func generateHTMLReport(sections []GradleReportSection) error {
 </head>
 <body>
   <h1>Gradle Dependency License Report</h1>
-  <p>This report includes both a flat table and an expandable dependency tree.</p>
   {{ range . }}
     <h2>File: {{ .FilePath }}</h2>
-    <p>Total Dependencies Found: {{ len .Dependencies }}</p>
+    <p>
+      Direct Dependencies: {{ .DirectCount }}<br>
+      Indirect Dependencies: {{ .IndirectCount }}<br>
+      Copyleft Dependencies: {{ .CopyleftCount }}<br>
+      Unknown License Dependencies: {{ .UnknownCount }}
+    </p>
     <h3>Dependencies Table</h3>
     <table>
       <thead>
@@ -1034,7 +1066,8 @@ func printConsoleReport(sections []GradleReportSection) {
 	fmt.Println("----- Console Dependency Report -----")
 	for _, sec := range sections {
 		fmt.Printf("File: %s\n", sec.FilePath)
-		fmt.Printf("Direct Dependencies: %d, Transitive: %d\n", len(sec.Dependencies), sec.TransitiveCount)
+		fmt.Printf("Direct Dependencies: %d, Indirect Dependencies: %d, Copyleft: %d, Unknown: %d\n",
+			sec.DirectCount, sec.IndirectCount, sec.CopyleftCount, sec.UnknownCount)
 		fmt.Println("Flat Dependencies:")
 		var keys []string
 		for k := range sec.Dependencies {
@@ -1092,6 +1125,29 @@ func main() {
 	channelMutex.Unlock()
 	close(pomRequests)
 	wgWorkers.Wait()
+
+	// Compute summary metrics for each section.
+	for idx := range sections {
+		sec := &sections[idx]
+		var directCount, indirectCount, copyleftCount, unknownCount int
+		for _, info := range sec.Dependencies {
+			if info.Parent == "direct" {
+				directCount++
+			} else {
+				indirectCount++
+			}
+			if isCopyleft(info.License) {
+				copyleftCount++
+			}
+			if info.License == "Unknown" {
+				unknownCount++
+			}
+		}
+		sec.DirectCount = directCount
+		sec.IndirectCount = indirectCount
+		sec.CopyleftCount = copyleftCount
+		sec.UnknownCount = unknownCount
+	}
 
 	fmt.Println("Generating HTML report...")
 	if err := generateHTMLReport(sections); err != nil {
