@@ -284,7 +284,6 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 		var rootNodes []*GradleDependencyNode
 		var queue []queueItem
 		visitedBFS := make(map[string]bool)
-
 		// Initialize BFS with direct dependencies.
 		for ga, info := range sec.Dependencies {
 			visitedBFS[ga] = true
@@ -303,7 +302,6 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 				ParentNode:    n,
 			})
 		}
-
 		// Process the BFS queue.
 		for len(queue) > 0 {
 			it := queue[0]
@@ -315,7 +313,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 			}
 			pom, err := concurrentFetchPOM(gid, aid, it.Version)
 			if err != nil || pom == nil {
-				fmt.Printf("⚠️ BFS: Skipping %s:%s:%s due to error.\n", gid, aid, it.Version)
+				fmt.Printf("BFS: Skipping %s:%s:%s due to error.\n", gid, aid, it.Version)
 				continue
 			}
 			if it.ParentNode != nil {
@@ -924,7 +922,6 @@ func printTreeNode(node *GradleDependencyNode, indent int) {
 // -------------------------------------------------------------------------------------
 
 func main() {
-	// Ensure the worker pool is shut down.
 	defer close(pomRequests)
 	defer wgWorkers.Wait()
 
@@ -941,13 +938,16 @@ func main() {
 		fmt.Printf("Error parsing build.gradle files: %v\n", err)
 		os.Exit(1)
 	}
+
 	fmt.Println("Starting transitive dependency resolution...")
 	buildTransitiveClosure(sections)
+
 	fmt.Println("Generating HTML report...")
 	if err := generateHTMLReport(sections); err != nil {
 		fmt.Printf("Error generating HTML report: %v\n", err)
 		os.Exit(1)
 	}
+
 	fmt.Println("Printing console report...")
 	printConsoleReport(sections)
 	fmt.Println("Analysis complete.")
