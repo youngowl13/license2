@@ -24,13 +24,14 @@ const (
 	localPOMCacheDir = ".pom-cache"     // Directory for disk caching of POMs
 	pomWorkerCount   = 10               // Number of concurrent POM fetch workers
 	maxParentDepth   = 10               // Maximum parent POM resolution depth
-	fetchTimeout     = 10 * time.Second // HTTP request timeout
+	fetchTimeout     = 10 * time.Second // Timeout per HTTP request
 )
 
 // -------------------------------------------------------------------------------------
 // DATA STRUCTURES
 // -------------------------------------------------------------------------------------
 
+// GradleDependencyNode represents one node in the dependency tree.
 type GradleDependencyNode struct {
 	Name       string
 	Version    string
@@ -40,12 +41,14 @@ type GradleDependencyNode struct {
 	Transitive []*GradleDependencyNode
 }
 
+// ExtendedDepInfo is used for the flat dependency table.
 type ExtendedDepInfo struct {
 	Display string // Version to display
 	Lookup  string // Version used for resolution
 	Parent  string // "direct" or parent's GAV
 }
 
+// GradleReportSection holds the results for one build.gradle file.
 type GradleReportSection struct {
 	FilePath        string
 	Dependencies    map[string]ExtendedDepInfo // Flat map after BFS resolution
@@ -53,6 +56,7 @@ type GradleReportSection struct {
 	TransitiveCount int                        // Count of transitive dependencies
 }
 
+// MavenPOM is the minimal structure parsed from a POM file.
 type MavenPOM struct {
 	XMLName        xml.Name `xml:"project"`
 	Parent         POMParent   `xml:"parent"`
@@ -68,12 +72,14 @@ type MavenPOM struct {
 	Version    string `xml:"version"`
 }
 
+// POMParent holds parent POM information.
 type POMParent struct {
 	GroupID    string `xml:"groupId"`
 	ArtifactID string `xml:"artifactId"`
 	Version    string `xml:"version"`
 }
 
+// POMDep represents a dependency entry in a POM.
 type POMDep struct {
 	GroupID    string `xml:"groupId"`
 	ArtifactID string `xml:"artifactId"`
@@ -82,11 +88,13 @@ type POMDep struct {
 	Optional   string `xml:"optional"`
 }
 
+// depState is used for BFS conflict resolution.
 type depState struct {
 	Version string
 	Depth   int
 }
 
+// queueItem is used in the BFS.
 type queueItem struct {
 	GroupArtifact string
 	Version       string
@@ -94,6 +102,7 @@ type queueItem struct {
 	ParentNode    *GradleDependencyNode
 }
 
+// fetchRequest is used for concurrent POM fetching.
 type fetchRequest struct {
 	GroupID    string
 	ArtifactID string
@@ -106,6 +115,7 @@ type fetchResult struct {
 	Err error
 }
 
+// LicenseData holds license info for HTML reporting.
 type LicenseData struct {
 	LicenseName string
 	ProjectURL  string
@@ -515,7 +525,7 @@ func isCopyleft(name string) bool {
 }
 
 // -------------------------------------------------------------------------------------
-// STEP 4: CONCURRENT POM FETCH & DISK CACHING (POM Fetch Functions)
+// STEP 4: CONCURRENT POM FETCH & DISK CACHING (POM FETCH FUNCTIONS)
 // -------------------------------------------------------------------------------------
 
 func concurrentFetchPOM(g, a, v string) (*MavenPOM, error) {
@@ -780,7 +790,6 @@ func generateHTMLReport(sections []GradleReportSection) error {
     tr.copyleft { background-color: #ffdddd; }
     tr.non-copyleft { background-color: #ddffdd; }
     tr.unknown-license { background-color: #ffffdd; }
-
     details.copyleft > summary {
       background-color: #ffdddd;
       padding: 2px 4px;
@@ -801,11 +810,9 @@ func generateHTMLReport(sections []GradleReportSection) error {
 <body>
   <h1>Gradle Dependency License Report</h1>
   <p>This report includes both a flat table and an expandable dependency tree.</p>
-
   {{ range . }}
     <h2>File: {{ .FilePath }}</h2>
     <p>Total Dependencies Found: {{ len .Dependencies }}</p>
-
     <h3>Dependencies Table</h3>
     <table>
       <thead>
@@ -846,7 +853,6 @@ func generateHTMLReport(sections []GradleReportSection) error {
         {{ end }}
       </tbody>
     </table>
-
     <h3>Dependency Tree</h3>
     {{ buildGradleTreesHTML .DependencyTree }}
   {{ end }}
@@ -862,4 +868,80 @@ func generateHTMLReport(sections []GradleReportSection) error {
 		return err
 	}
 	outputFile := filepath.Join(outDir, "dependency-license-report.html")
-	f, err := os.Create(
+	f, err := os.Create(outputFile)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	if err := tmpl.Execute(f, sections); err != nil {
+		return err
+	}
+	fmt.Printf("✅ License report generated at %s\n", outputFile)
+	return nil
+}
+
+// -------------------------------------------------------------------------------------
+// ADDITIONAL: PRINT PROGRESS REPORT TO CONSOLE
+// -------------------------------------------------------------------------------------
+
+func printConsoleReport(sections []GradleReportSection) {
+	fmt.Println("----- Console Dependency Report -----")
+	for _, sec := range sections {
+		fmt.Printf("File: %s\n", sec.FilePath)
+		fmt.Printf("Direct Dependencies: %d, Transitive: %d\n", len(sec.Dependencies), sec.TransitiveCount)
+		fmt.Println("Flat Dependencies:")
+		var keys []string
+		for k := range sec.Dependencies {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, k := range keys {
+			info := sec.Dependencies[k]
+			fmt.Printf("  %s -> %s (Parent: %s)\n", k, info.Display, info.Parent)
+		}
+		fmt.Println("Dependency Tree:")
+		for _, node := range sec.DependencyTree {
+			printTreeNode(node, 0)
+		}
+		fmt.Println("-------------------------------------")
+	}
+}
+
+func printTreeNode(node *GradleDependencyNode, indent int) {
+	prefix := strings.Repeat("  ", indent)
+	fmt.Printf("%s%s@%s (License: %s)\n", prefix, node.Name, node.Version, node.License)
+	for _, child := range node.Transitive {
+		printTreeNode(child, indent+1)
+	}
+}
+
+// -------------------------------------------------------------------------------------
+// MAIN FUNCTION
+// -------------------------------------------------------------------------------------
+
+func main() {
+	defer close(pomRequests)
+	defer wgWorkers.Wait()
+	fmt.Println("Starting dependency analysis...")
+	files, err := findBuildGradleFiles(".")
+	if err != nil {
+		fmt.Printf("Error scanning for build.gradle files: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Found %d build.gradle file(s).\n", len(files))
+	sections, err := parseAllBuildGradleFiles(files)
+	if err != nil {
+		fmt.Printf("Error parsing build.gradle files: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Starting transitive dependency resolution...")
+	buildTransitiveClosure(sections)
+	fmt.Println("Generating HTML report...")
+	if err := generateHTMLReport(sections); err != nil {
+		fmt.Printf("Error generating HTML report: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Println("Printing console report...")
+	printConsoleReport(sections)
+	fmt.Println("Analysis complete.")
+}
