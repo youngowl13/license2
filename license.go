@@ -21,10 +21,10 @@ import (
 // -------------------------------------------------------------------------------------
 
 const (
-	localPOMCacheDir = ".pom-cache"     // Directory for disk caching of POMs
-	pomWorkerCount   = 10               // Number of concurrent POM fetch workers
-	maxParentDepth   = 10               // Maximum parent POM resolution depth
-	fetchTimeout     = 30 * time.Second // HTTP request timeout
+	localPOMCacheDir = ".pom-cache"         // Directory for disk caching of POMs
+	pomWorkerCount   = 10                   // Number of concurrent POM fetch workers
+	maxParentDepth   = 10                   // Maximum parent POM resolution depth
+	fetchTimeout     = 30 * time.Second     // HTTP request timeout
 )
 
 // -------------------------------------------------------------------------------------
@@ -37,15 +37,18 @@ type GradleDependencyNode struct {
 	Version    string
 	License    string
 	Copyleft   bool
-	Parent     string // "direct" for direct dependencies or parent's GAV for transitive dependencies.
+	Parent     string // "direct" or parent's GAV for transitive dependencies.
 	Transitive []*GradleDependencyNode
 }
 
-// ExtendedDepInfo holds info for the flat dependency table.
+// ExtendedDepInfo now includes license fields.
 type ExtendedDepInfo struct {
-	Display string // What to display (if unresolved, "version not available")
-	Lookup  string // The version as parsed from file (may be "unknown")
-	Parent  string // "direct" or parent's GAV
+	Display           string // What to display (if unresolved, "version not available")
+	Lookup            string // Version as parsed from file (may be "unknown")
+	Parent            string // "direct" or parent's GAV
+	License           string // License name (if available)
+	LicenseProjectURL string // URL for project details (or Google search URL if unresolved)
+	LicensePomURL     string // URL for viewing the POM file
 }
 
 // GradleReportSection holds results for one build.gradle file.
@@ -115,7 +118,7 @@ type fetchResult struct {
 	Err error
 }
 
-// LicenseData holds license info for HTML reporting.
+// LicenseData holds license info (used in dynamic fetch).
 type LicenseData struct {
 	LicenseName string
 	ProjectURL  string
@@ -128,7 +131,7 @@ type LicenseData struct {
 
 var (
 	pomCache    sync.Map // key = "group:artifact:version" -> *MavenPOM
-	parentVisit sync.Map // used to detect cycles in parent resolution
+	parentVisit sync.Map // to detect cycles in parent resolution
 	pomRequests = make(chan fetchRequest, 50)
 	wgWorkers   sync.WaitGroup
 
@@ -273,20 +276,17 @@ func parseVersionRange(v string) string {
 }
 
 // -------------------------------------------------------------------------------------
-// Helper: getLatestVersion - fetches the latest version from Maven Central and Google Maven.
-// This is used only when the version was not provided in the build file.
+// Helper: getLatestVersion - used only when the build file did not provide a literal version.
 // -------------------------------------------------------------------------------------
 
 func getLatestVersion(g, a string) (string, error) {
 	groupPath := strings.ReplaceAll(g, ".", "/")
-	// Try Maven Central.
 	mavenURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/maven-metadata.xml", groupPath, a)
 	fmt.Printf("getLatestVersion: Fetching metadata from Maven Central: %s\n", mavenURL)
 	version, err := fetchLatestVersionFromURL(mavenURL)
 	if err == nil && version != "" {
 		return version, nil
 	}
-	// Try Google Maven.
 	googleURL := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/maven-metadata.xml", groupPath, a)
 	fmt.Printf("getLatestVersion: Fetching metadata from Google Maven: %s\n", googleURL)
 	version, err = fetchLatestVersionFromURL(googleURL)
@@ -482,7 +482,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 		}
 		direct := len(rootNodes)
 		sec.TransitiveCount = total - direct
-		// For dependencies that did not have version info in the file, mark display as "version not available"
+		// For dependencies without literal version info, mark display as "version not available".
 		for key, info := range sec.Dependencies {
 			if strings.Contains(info.Lookup, "${") || strings.ToLower(info.Lookup) == "unknown" {
 				info.Display = "version not available"
@@ -830,8 +830,41 @@ func localCachePath(g, a, v string) string {
 }
 
 // -------------------------------------------------------------------------------------
-// HTML REPORT GENERATION
+// HTML REPORT GENERATION (using precomputed license info)
 // -------------------------------------------------------------------------------------
+
+// Before generating the report, precompute license info for each dependency.
+func precomputeLicenseInfo(sections []GradleReportSection) {
+	for idx := range sections {
+		sec := &sections[idx]
+		for dep, info := range sec.Dependencies {
+			// If the version was unresolved in the file, we already set Display as "version not available"
+			// and we will leave the license as "Unknown" with a Google search URL.
+			if strings.Contains(info.Lookup, "${") || strings.ToLower(info.Lookup) == "unknown" {
+				info.License = "Unknown"
+				info.LicenseProjectURL = fmt.Sprintf("https://www.google.com/search?q=%s+%s+license", strings.Split(dep, "/")[0], strings.Split(dep, "/")[1])
+				info.LicensePomURL = ""
+			} else {
+				// Otherwise, fetch the POM and compute license info.
+				parts := strings.Split(dep, "/")
+				g, a := parts[0], parts[1]
+				pom, err := concurrentFetchPOM(g, a, info.Lookup)
+				if err != nil || pom == nil {
+					info.License = "Unknown"
+					info.LicenseProjectURL = fmt.Sprintf("https://www.google.com/search?q=%s+%s+%s+license", g, a, info.Lookup)
+					info.LicensePomURL = ""
+				} else {
+					lic := detectLicense(pom)
+					info.License = lic
+					groupPath := strings.ReplaceAll(g, ".", "/")
+					info.LicenseProjectURL = fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/", groupPath, a, info.Lookup)
+					info.LicensePomURL = fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, info.Lookup, a, info.Lookup)
+				}
+			}
+			sec.Dependencies[dep] = info
+		}
+	}
+}
 
 func buildGradleTreeHTML(node *GradleDependencyNode, level int) string {
 	class := "non-copyleft"
@@ -859,39 +892,9 @@ func buildGradleTreesHTML(nodes []*GradleDependencyNode) template.HTML {
 	return template.HTML(buf.String())
 }
 
-func getLicenseInfoWrapper(dep, version string) LicenseData {
-	parts := strings.Split(dep, "/")
-	if len(parts) != 2 {
-		return LicenseData{LicenseName: "Unknown"}
-	}
-	g, a := parts[0], parts[1]
-	// If version was unresolved in the build file, return a Google search URL.
-	if strings.Contains(version, "${") || strings.ToLower(version) == "unknown" {
-		return LicenseData{
-			LicenseName: "Unknown",
-			ProjectURL:  fmt.Sprintf("https://www.google.com/search?q=%s+%s+license", g, a),
-			PomURL:      "",
-		}
-	}
-	pom, err := concurrentFetchPOM(g, a, version)
-	if err != nil || pom == nil {
-		return LicenseData{
-			LicenseName: "Unknown",
-			ProjectURL:  fmt.Sprintf("https://www.google.com/search?q=%s+%s+%s+license", g, a, version),
-		}
-	}
-	licenseName := detectLicense(pom)
-	groupPath := strings.ReplaceAll(g, ".", "/")
-	projURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/", groupPath, a, version)
-	pomURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, version, a, version)
-	return LicenseData{
-		LicenseName: licenseName,
-		ProjectURL:  projURL,
-		PomURL:      pomURL,
-	}
-}
-
 func generateHTMLReport(sections []GradleReportSection) error {
+	// Precompute license info before generating the report.
+	precomputeLicenseInfo(sections)
 	outDir := "./license-checker"
 	if err := os.MkdirAll(outDir, 0755); err != nil {
 		return err
@@ -951,25 +954,18 @@ func generateHTMLReport(sections []GradleReportSection) error {
       </thead>
       <tbody>
         {{ range $dep, $info := .Dependencies }}
-          {{ $licData := getLicenseInfoWrapper $dep $info.Lookup }}
-          {{ if eq $licData.LicenseName "Unknown" }}
-            <tr class="unknown-license">
-          {{ else if isCopyleft $licData.LicenseName }}
-            <tr class="copyleft">
-          {{ else }}
-            <tr class="non-copyleft">
-          {{ end }}
+          <tr {{ if eq $info.License "Unknown" }}class="unknown-license"{{ else if isCopyleft $info.License }}class="copyleft"{{ else }}class="non-copyleft"{{ end }}>
             <td>{{ $dep }}</td>
             <td>{{ $info.Display }}</td>
-            <td>{{ $licData.LicenseName }}</td>
+            <td>{{ $info.License }}</td>
             <td>{{ $info.Parent }}</td>
-            {{ if $licData.ProjectURL }}
-              <td><a href="{{ $licData.ProjectURL }}" target="_blank">View Details</a></td>
+            {{ if $info.LicenseProjectURL }}
+              <td><a href="{{ $info.LicenseProjectURL }}" target="_blank">View Details</a></td>
             {{ else }}
               <td></td>
             {{ end }}
-            {{ if $licData.PomURL }}
-              <td><a href="{{ $licData.PomURL }}" target="_blank">View POM</a></td>
+            {{ if $info.LicensePomURL }}
+              <td><a href="{{ $info.LicensePomURL }}" target="_blank">View POM</a></td>
             {{ else }}
               <td></td>
             {{ end }}
@@ -984,9 +980,8 @@ func generateHTMLReport(sections []GradleReportSection) error {
 </html>
 `
 	tmpl, err := template.New("report").Funcs(template.FuncMap{
-		"buildGradleTreesHTML":  buildGradleTreesHTML,
-		"getLicenseInfoWrapper": getLicenseInfoWrapper,
-		"isCopyleft":            isCopyleft,
+		"buildGradleTreesHTML": buildGradleTreesHTML,
+		"isCopyleft":           isCopyleft,
 	}).Parse(tmplText)
 	if err != nil {
 		return err
@@ -1021,7 +1016,7 @@ func printConsoleReport(sections []GradleReportSection) {
 		sort.Strings(keys)
 		for _, k := range keys {
 			info := sec.Dependencies[k]
-			fmt.Printf("  %s -> %s (Parent: %s)\n", k, info.Display, info.Parent)
+			fmt.Printf("  %s -> %s (Parent: %s, License: %s)\n", k, info.Display, info.Parent, info.License)
 		}
 		fmt.Println("Dependency Tree:")
 		for _, node := range sec.DependencyTree {
@@ -1064,9 +1059,9 @@ func main() {
 	}
 	fmt.Println("Starting transitive dependency resolution...")
 	buildTransitiveClosure(sections)
-	// Once BFS is done, no more requests will be sent; close the channel.
+	// All requests have been sent by BFS; now close the channel.
 	close(pomRequests)
-	// Wait for all worker goroutines to finish.
+	// Wait for all workers to finish.
 	wgWorkers.Wait()
 
 	fmt.Println("Generating HTML report...")
