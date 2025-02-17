@@ -23,8 +23,8 @@ import (
 const (
 	localPOMCacheDir = ".pom-cache"         // Directory for disk caching of POMs
 	pomWorkerCount   = 10                   // Number of concurrent POM fetch workers
-	maxParentDepth   = 10                   // Maximum parent POM resolution depth
-	fetchTimeout     = 30 * time.Second     // HTTP request timeout
+	// maxParentDepth is no longer used to limit transitive parent resolution.
+	fetchTimeout = 30 * time.Second // HTTP request timeout
 )
 
 // -------------------------------------------------------------------------------------
@@ -37,7 +37,7 @@ var (
 	pomRequests = make(chan fetchRequest, 50)
 	wgWorkers   sync.WaitGroup
 
-	// channelOpen indicates if pomRequests is still open.
+	// A flag (with mutex) to indicate if pomRequests channel is still open.
 	channelOpen  = true
 	channelMutex sync.Mutex
 
@@ -75,11 +75,11 @@ type GradleDependencyNode struct {
 // ExtendedDepInfo holds info for the flat dependency table.
 type ExtendedDepInfo struct {
 	Display           string // What to display ("version not available" if not provided in file)
-	Lookup            string // Version as parsed from file (may be "unknown")
+	Lookup            string // The version as parsed from file (may be "unknown")
 	Parent            string // "direct" or parent's GAV
-	License           string // License name (precomputed)
-	LicenseProjectURL string // Project details URL (or Google search URL if unresolved)
-	LicensePomURL     string // POM file URL
+	License           string // Precomputed license name
+	LicenseProjectURL string // URL for project details (or Google search URL if unresolved)
+	LicensePomURL     string // URL for viewing the POM file
 }
 
 // GradleReportSection holds results for one build.gradle file.
@@ -342,7 +342,7 @@ func fetchLatestVersionFromURL(url string) (string, error) {
 }
 
 // -------------------------------------------------------------------------------------
-// STEP 2: BFS + MULTI-LEVEL PARENT RESOLUTION
+// STEP 2: BFS + MULTI-LEVEL PARENT RESOLUTION (No limitation on depth)
 // -------------------------------------------------------------------------------------
 
 func buildTransitiveClosure(sections []GradleReportSection) {
@@ -381,7 +381,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 			if gid == "" || aid == "" {
 				continue
 			}
-			// Only do dynamic lookup if the file did not provide a literal version.
+			// Only do dynamic lookup if no literal version was provided in the file.
 			if strings.Contains(it.Version, "${") || strings.ToLower(it.Version) == "unknown" {
 				latest, err := getLatestVersion(gid, aid)
 				if err != nil {
@@ -486,7 +486,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 		}
 		direct := len(rootNodes)
 		sec.TransitiveCount = total - direct
-		// For dependencies without a literal version from the file, mark display as "version not available"
+		// For dependencies that did not have literal version info in the file, mark display as "version not available"
 		for key, info := range sec.Dependencies {
 			if strings.Contains(info.Lookup, "${") || strings.ToLower(info.Lookup) == "unknown" {
 				info.Display = "version not available"
@@ -637,7 +637,7 @@ func concurrentFetchPOM(g, a, v string) (*MavenPOM, error) {
 	open := channelOpen
 	channelMutex.Unlock()
 	if !open {
-		// Channel is closed; perform direct fetch.
+		// Channel closed; perform direct fetch.
 		fmt.Printf("concurrentFetchPOM: Channel closed, doing direct fetch for %s:%s:%s\n", g, a, v)
 		if c, ok := pomCache.Load(key); ok {
 			return c.(*MavenPOM), nil
@@ -713,9 +713,7 @@ func retrieveOrLoadPOM(g, a, v string) (*MavenPOM, error) {
 }
 
 func loadAllParents(p *MavenPOM, depth int) error {
-	if depth > maxParentDepth {
-		return fmt.Errorf("parent POM recursion depth exceeded limit (%d)", maxParentDepth)
-	}
+	// Removed depth limit to check all transitive parent POMs.
 	if p.Parent.GroupID == "" || p.Parent.ArtifactID == "" || p.Parent.Version == "" {
 		return nil
 	}
@@ -851,10 +849,10 @@ func localCachePath(g, a, v string) string {
 }
 
 // -------------------------------------------------------------------------------------
-// HTML REPORT GENERATION (License info precomputed)
+// HTML REPORT GENERATION (Precomputed License Info)
 // -------------------------------------------------------------------------------------
 
-// precomputeLicenseInfo iterates over each dependency and precomputes its license info.
+// precomputeLicenseInfo iterates over each dependency and fetches its license info.
 func precomputeLicenseInfo(sections []GradleReportSection) {
 	for idx := range sections {
 		sec := &sections[idx]
@@ -864,7 +862,7 @@ func precomputeLicenseInfo(sections []GradleReportSection) {
 				continue
 			}
 			g, a := parts[0], parts[1]
-			// If version was unresolved in the file, mark license as Unknown with a Google search URL.
+			// If the version was not provided in the file, mark as "version not available" and use a Google search.
 			if strings.Contains(info.Lookup, "${") || strings.ToLower(info.Lookup) == "unknown" {
 				info.License = "Unknown"
 				info.LicenseProjectURL = fmt.Sprintf("https://www.google.com/search?q=%s+%s+license", g, a)
@@ -1061,7 +1059,7 @@ func printTreeNode(node *GradleDependencyNode, indent int) {
 // -------------------------------------------------------------------------------------
 
 func main() {
-	// Start the worker pool.
+	// Start worker pool.
 	for i := 0; i < pomWorkerCount; i++ {
 		wgWorkers.Add(1)
 		go pomFetchWorker()
@@ -1081,12 +1079,12 @@ func main() {
 	}
 	fmt.Println("Starting transitive dependency resolution...")
 	buildTransitiveClosure(sections)
-	// All BFS requests are done. Now mark the channel as closed.
+	// All BFS requests are done; now mark the channel as closed.
 	channelMutex.Lock()
 	channelOpen = false
 	channelMutex.Unlock()
 	close(pomRequests)
-	// Wait for workers to finish.
+	// Wait for all worker goroutines to finish.
 	wgWorkers.Wait()
 
 	fmt.Println("Generating HTML report...")
