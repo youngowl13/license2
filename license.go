@@ -21,10 +21,10 @@ import (
 // -------------------------------------------------------------------------------------
 
 const (
-	localPOMCacheDir = ".pom-cache"         // Directory for disk caching of POMs
-	pomWorkerCount   = 10                   // Number of concurrent POM fetch workers
-	maxParentDepth   = 10                   // Maximum parent POM resolution depth
-	fetchTimeout     = 30 * time.Second     // HTTP request timeout (30 seconds)
+	localPOMCacheDir = ".pom-cache"     // Directory for disk caching of POMs
+	pomWorkerCount   = 10               // Number of concurrent POM fetch workers
+	maxParentDepth   = 10               // Maximum parent POM resolution depth
+	fetchTimeout     = 30 * time.Second // HTTP request timeout
 )
 
 // -------------------------------------------------------------------------------------
@@ -37,14 +37,14 @@ type GradleDependencyNode struct {
 	Version    string
 	License    string
 	Copyleft   bool
-	Parent     string // "direct" or parent's GAV for transitive dependencies.
+	Parent     string // "direct" for direct dependencies or parent's GAV for transitive dependencies.
 	Transitive []*GradleDependencyNode
 }
 
 // ExtendedDepInfo holds info for the flat dependency table.
 type ExtendedDepInfo struct {
-	Display string // What to display ("version not available" if not provided in file)
-	Lookup  string // The version as parsed from file (or "unknown")
+	Display string // What to display (if unresolved, "version not available")
+	Lookup  string // The version as parsed from file (may be "unknown")
 	Parent  string // "direct" or parent's GAV
 }
 
@@ -215,7 +215,6 @@ func parseBuildGradleFile(filePath string) (map[string]ExtendedDepInfo, error) {
 		version := "unknown"
 		if len(parts) >= 3 {
 			version = parseVersionRange(parts[2])
-			// If a variable interpolation exists, try to replace it using varMap.
 			if strings.Contains(version, "${") {
 				reVar := regexp.MustCompile(`\$\{([^}]+)\}`)
 				version = reVar.ReplaceAllStringFunc(version, func(s string) string {
@@ -225,7 +224,6 @@ func parseBuildGradleFile(filePath string) (map[string]ExtendedDepInfo, error) {
 					}
 					return ""
 				})
-				// If after interpolation nothing remains, mark as "unknown"
 				if version == "" {
 					version = "unknown"
 				}
@@ -260,7 +258,6 @@ func parseAllBuildGradleFiles(files []string) ([]GradleReportSection, error) {
 
 func parseVersionRange(v string) string {
 	v = strings.TrimSpace(v)
-	// If version is in a range, pick the lower bound.
 	if (strings.HasPrefix(v, "[") || strings.HasPrefix(v, "(")) && strings.Contains(v, ",") {
 		trimmed := strings.Trim(v, "[]() ")
 		parts := strings.Split(trimmed, ",")
@@ -276,7 +273,8 @@ func parseVersionRange(v string) string {
 }
 
 // -------------------------------------------------------------------------------------
-// Helper: getLatestVersion - fetches the latest version from metadata on Maven Central and Google Maven.
+// Helper: getLatestVersion - fetches the latest version from Maven Central and Google Maven.
+// This is used only when the version was not provided in the build file.
 // -------------------------------------------------------------------------------------
 
 func getLatestVersion(g, a string) (string, error) {
@@ -340,7 +338,7 @@ func fetchLatestVersionFromURL(url string) (string, error) {
 }
 
 // -------------------------------------------------------------------------------------
-// STEP 2: BFS + NEAREST-WINS + MULTI-LEVEL PARENT RESOLUTION
+// STEP 2: BFS + MULTI-LEVEL PARENT RESOLUTION
 // -------------------------------------------------------------------------------------
 
 func buildTransitiveClosure(sections []GradleReportSection) {
@@ -379,7 +377,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 			if gid == "" || aid == "" {
 				continue
 			}
-			// Only perform dynamic version lookup if the file did not provide a literal version.
+			// Only do dynamic lookup if the file did not provide a literal version.
 			if strings.Contains(it.Version, "${") || strings.ToLower(it.Version) == "unknown" {
 				latest, err := getLatestVersion(gid, aid)
 				if err != nil {
@@ -867,7 +865,7 @@ func getLicenseInfoWrapper(dep, version string) LicenseData {
 		return LicenseData{LicenseName: "Unknown"}
 	}
 	g, a := parts[0], parts[1]
-	// If version was unresolved in the file, return a Google search URL.
+	// If version was unresolved in the build file, return a Google search URL.
 	if strings.Contains(version, "${") || strings.ToLower(version) == "unknown" {
 		return LicenseData{
 			LicenseName: "Unknown",
@@ -1046,10 +1044,7 @@ func printTreeNode(node *GradleDependencyNode, indent int) {
 // -------------------------------------------------------------------------------------
 
 func main() {
-	defer close(pomRequests)
-	defer wgWorkers.Wait()
-
-	// Start worker pool.
+	// Start the worker pool.
 	for i := 0; i < pomWorkerCount; i++ {
 		wgWorkers.Add(1)
 		go pomFetchWorker()
@@ -1069,6 +1064,11 @@ func main() {
 	}
 	fmt.Println("Starting transitive dependency resolution...")
 	buildTransitiveClosure(sections)
+	// Once BFS is done, no more requests will be sent; close the channel.
+	close(pomRequests)
+	// Wait for all worker goroutines to finish.
+	wgWorkers.Wait()
+
 	fmt.Println("Generating HTML report...")
 	if err := generateHTMLReport(sections); err != nil {
 		fmt.Printf("Error generating HTML report: %v\n", err)
