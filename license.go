@@ -21,28 +21,26 @@ import (
 // -----------------------------------------------------------------------
 
 const (
-	localPOMCacheDir = ".pom-cache"         // Directory for disk caching of POMs
-	pomWorkerCount   = 10                   // Number of concurrent POM fetch workers
-	fetchTimeout     = 30 * time.Second     // HTTP request timeout
+	localPOMCacheDir = ".pom-cache"
+	pomWorkerCount   = 10
+	fetchTimeout     = 30 * time.Second
 )
 
 // -----------------------------------------------------------------------
-// GLOBAL VARIABLES
+// GLOBALS
 // -----------------------------------------------------------------------
 
 var (
 	pomCache    sync.Map // key = "group:artifact:version" -> *MavenPOM
-	parentVisit sync.Map // for cycle detection in parent resolution
+	parentVisit sync.Map // to detect cycles in parent POM resolution
 
-	// Channel for POM fetch requests and wait group for workers.
 	pomRequests = make(chan fetchRequest, 50)
 	wgWorkers   sync.WaitGroup
 
-	// Channel open flag
 	channelOpen  = true
 	channelMutex sync.Mutex
 
-	// Known SPDX licenses and whether they are copyleft.
+	// Some known SPDX licenses
 	spdxLicenseMap = map[string]struct {
 		Name     string
 		Copyleft bool
@@ -64,42 +62,42 @@ var (
 // DATA STRUCTURES
 // -----------------------------------------------------------------------
 
-// ExtendedDepInfo holds info for a dependency (for the flat table).
+// ExtendedDepInfo holds flat-table info for a single dependency.
 type ExtendedDepInfo struct {
-	Display           string // What to display (e.g. "1.4.10" or "version not available")
-	Lookup            string // Version as parsed from file (may be "unknown")
-	Parent            string // "direct" or parent's GAV string
-	License           string // Final license string
-	LicenseProjectURL string // URL for project details (or Google search if unresolved)
-	LicensePomURL     string // URL to view the POM file
+	Display           string // display version (e.g. "1.4.10" or "version not available")
+	Lookup            string // the version used for resolution (may be "unknown")
+	Parent            string // "direct" or parent's GAV
+	License           string // final license string
+	LicenseProjectURL string // link to project details or google search
+	LicensePomURL     string // link to the POM file
 }
 
-// GradleDependencyNode represents a node in the dependency tree.
+// GradleDependencyNode is a node in the dependency tree.
 type GradleDependencyNode struct {
 	Name       string
 	Version    string
 	License    string
 	Copyleft   bool
-	Parent     string // "direct" for direct deps or parent's GAV for transitive deps
+	Parent     string
 	Transitive []*GradleDependencyNode
 }
 
-// GradleReportSection holds data for one build.gradle file.
+// GradleReportSection holds data for one build.gradle file's analysis.
 type GradleReportSection struct {
 	FilePath        string
-	Dependencies    map[string]ExtendedDepInfo // Flat map with keys "group/artifact@version"
-	DependencyTree  []*GradleDependencyNode    // Hierarchical dependency tree
-	TransitiveCount int                        // Total transitive dependency count
-	DirectCount     int                        // Count of direct dependencies
-	IndirectCount   int                        // Count of indirect dependencies
-	CopyleftCount   int                        // Count of copyleft licenses
-	UnknownCount    int                        // Count of dependencies with "Unknown" license
+	Dependencies    map[string]ExtendedDepInfo // "group/artifact@version" -> ExtendedDepInfo
+	DependencyTree  []*GradleDependencyNode
+	TransitiveCount int
+	DirectCount     int
+	IndirectCount   int
+	CopyleftCount   int
+	UnknownCount    int
 }
 
-// MavenPOM represents the structure parsed from a POM file.
+// MavenPOM is the minimal structure we parse from each .pom file.
 type MavenPOM struct {
 	XMLName        xml.Name `xml:"project"`
-	Parent         POMParent   `xml:"parent"`
+	Parent         POMParent
 	DependencyMgmt struct {
 		Dependencies []POMDep `xml:"dependencies>dependency"`
 	} `xml:"dependencyManagement"`
@@ -112,14 +110,14 @@ type MavenPOM struct {
 	Version    string `xml:"version"`
 }
 
-// POMParent holds the <parent> info.
+// POMParent holds <parent> info from a Maven POM.
 type POMParent struct {
 	GroupID    string `xml:"groupId"`
 	ArtifactID string `xml:"artifactId"`
 	Version    string `xml:"version"`
 }
 
-// POMDep represents one dependency entry in a POM.
+// POMDep is a <dependency> entry in a POM.
 type POMDep struct {
 	GroupID    string `xml:"groupId"`
 	ArtifactID string `xml:"artifactId"`
@@ -128,13 +126,13 @@ type POMDep struct {
 	Optional   string `xml:"optional"`
 }
 
-// depState is used during BFS to track version and depth.
+// depState holds BFS info: the selected version + BFS depth.
 type depState struct {
 	Version string
 	Depth   int
 }
 
-// queueItem represents an item in the BFS queue.
+// queueItem is an item in BFS queue.
 type queueItem struct {
 	GroupArtifact string
 	Version       string
@@ -142,7 +140,7 @@ type queueItem struct {
 	ParentNode    *GradleDependencyNode
 }
 
-// fetchRequest is used to request a POM from a worker.
+// fetchRequest is used by the concurrency pipeline for POM fetches.
 type fetchRequest struct {
 	GroupID    string
 	ArtifactID string
@@ -150,380 +148,198 @@ type fetchRequest struct {
 	ResultChan chan fetchResult
 }
 
-// fetchResult is the result from a worker.
+// fetchResult is the result from a POM fetch worker.
 type fetchResult struct {
 	POM *MavenPOM
 	Err error
 }
 
 // -----------------------------------------------------------------------
-// HELPER FUNCTIONS
+// HELPER: getLatestVersion
 // -----------------------------------------------------------------------
 
-// splitGA splits a string in the format "group/artifact" into group and artifact.
-func splitGA(ga string) (string, string) {
-	parts := strings.Split(ga, "/")
-	if len(parts) != 2 {
-		return "", ""
-	}
-	return parts[0], parts[1]
-}
-
-// skipScope returns true if the given dependency scope or optional flag means we skip it.
-func skipScope(scope, optional string) bool {
-	s := strings.ToLower(strings.TrimSpace(scope))
-	if s == "test" || s == "provided" || s == "system" {
-		return true
-	}
-	if strings.EqualFold(strings.TrimSpace(optional), "true") {
-		return true
-	}
-	return false
-}
-
-// parseVersionRange returns a version string from a range (e.g. "[1.2,2.0)") by choosing the lower bound.
-func parseVersionRange(v string) string {
-	v = strings.TrimSpace(v)
-	if (strings.HasPrefix(v, "[") || strings.HasPrefix(v, "(")) && strings.Contains(v, ",") {
-		trimmed := strings.Trim(v, "[]() ")
-		parts := strings.Split(trimmed, ",")
-		if len(parts) > 0 {
-			low := strings.TrimSpace(parts[0])
-			if low == "" {
-				low = "0.0"
-			}
-			return low
-		}
-	}
-	return v
-}
-
-// parseManagedVersions extracts managed versions from a POM's dependencyManagement section.
-func parseManagedVersions(pom *MavenPOM) map[string]string {
-	res := make(map[string]string)
-	for _, d := range pom.DependencyMgmt.Dependencies {
-		if skipScope(d.Scope, d.Optional) {
-			continue
-		}
-		if d.Version != "" {
-			key := d.GroupID + "/" + d.ArtifactID
-			res[key] = parseVersionRange(d.Version)
-		}
-	}
-	return res
-}
-
-// fallbackVersionRange tries to use the POM's own version or its parent's version as a fallback.
-func fallbackVersionRange(pom *MavenPOM, g, a string) string {
-	if g == pom.GroupID && pom.Version != "" {
-		return parseVersionRange(pom.Version)
-	}
-	if g == pom.Parent.GroupID && pom.Parent.Version != "" {
-		return parseVersionRange(pom.Parent.Version)
-	}
-	return ""
-}
-
-// sortRoots recursively sorts dependency tree nodes.
-func sortRoots(roots []*GradleDependencyNode) {
-	sort.Slice(roots, func(i, j int) bool {
-		return roots[i].Name < roots[j].Name
-	})
-	for _, r := range roots {
-		sortRoots(r.Transitive)
-	}
-}
-
-// countNodes returns the total number of nodes in a dependency tree.
-func countNodes(n *GradleDependencyNode) int {
-	count := 1
-	for _, c := range n.Transitive {
-		count += countNodes(c)
-	}
-	return count
-}
-
-// fillDepMap recursively fills a flat map of dependencies from the tree.
-// The key is "group/artifact@version".
-func fillDepMap(n *GradleDependencyNode, depMap map[string]ExtendedDepInfo) {
-	key := fmt.Sprintf("%s@%s", n.Name, n.Version)
-	info, exists := depMap[key]
-	if !exists {
-		info = ExtendedDepInfo{
-			Display: n.Version,
-			Lookup:  n.Version,
-			Parent:  n.Parent,
-		}
-	} else {
-		info.Display = n.Version
-		info.Lookup = n.Version
-		info.Parent = n.Parent
-	}
-	depMap[key] = info
-	for _, c := range n.Transitive {
-		fillDepMap(c, depMap)
-	}
-}
-
-// -----------------------------------------------------------------------
-// LICENSE DETECTION FUNCTIONS
-// -----------------------------------------------------------------------
-
-func detectLicense(pom *MavenPOM) string {
-	if len(pom.Licenses) == 0 {
-		return "Unknown"
-	}
-	lic := strings.TrimSpace(pom.Licenses[0].Name)
-	if lic == "" {
-		return "Unknown"
-	}
-	up := strings.ToUpper(lic)
-	for spdxID, data := range spdxLicenseMap {
-		if strings.EqualFold(lic, spdxID) || up == strings.ToUpper(spdxID) {
-			return data.Name
-		}
-	}
-	return lic
-}
-
-func isCopyleft(name string) bool {
-	// First, check against the SPDX map.
-	for spdxID, data := range spdxLicenseMap {
-		if data.Copyleft && (strings.EqualFold(name, data.Name) || strings.EqualFold(name, spdxID)) {
-			return true
-		}
-	}
-	// Fallback: check common keywords.
-	copyleftKeywords := []string{
-		"GPL", "LGPL", "AGPL", "CC BY-SA", "MPL", "EPL", "CPL", "CDDL",
-		"EUPL", "Affero", "OSL", "CeCILL", "GNU General Public License",
-		"GNU Lesser General Public License", "Mozilla Public License",
-		"Common Development and Distribution License", "Eclipse Public License",
-		"Common Public License", "European Union Public License", "Open Software License",
-	}
-	up := strings.ToUpper(name)
-	for _, kw := range copyleftKeywords {
-		if strings.Contains(up, strings.ToUpper(kw)) {
-			return true
-		}
-	}
-	return false
-}
-
-// -----------------------------------------------------------------------
-// POM FETCH FUNCTIONS & DISK CACHING
-// -----------------------------------------------------------------------
-
-type fetchRequest struct {
-	GroupID    string
-	ArtifactID string
-	Version    string
-	ResultChan chan fetchResult
-}
-
-type fetchResult struct {
-	POM *MavenPOM
-	Err error
-}
-
-func concurrentFetchPOM(g, a, v string) (*MavenPOM, error) {
-	key := fmt.Sprintf("%s:%s:%s", g, a, v)
-	if c, ok := pomCache.Load(key); ok {
-		return c.(*MavenPOM), nil
-	}
-	channelMutex.Lock()
-	open := channelOpen
-	channelMutex.Unlock()
-	if !open {
-		pom, err := fetchRemotePOM(g, a, v)
-		if err == nil && pom != nil {
-			pomCache.Store(key, pom)
-		}
-		return pom, err
-	}
-	resultChan := make(chan fetchResult, 1)
-	pomRequests <- fetchRequest{
-		GroupID:    g,
-		ArtifactID: a,
-		Version:    v,
-		ResultChan: resultChan,
-	}
-	res := <-resultChan
-	if res.Err == nil && res.POM != nil {
-		pomCache.Store(key, res.POM)
-	}
-	return res.POM, res.Err
-}
-
-func retrieveOrLoadPOM(g, a, v string) (*MavenPOM, error) {
-	key := fmt.Sprintf("%s:%s:%s", g, a, v)
-	if c, ok := pomCache.Load(key); ok {
-		return c.(*MavenPOM), nil
-	}
-	pom, err := loadPOMFromDisk(g, a, v)
-	if err == nil && pom != nil {
-		pomCache.Store(key, pom)
-		return pom, nil
-	}
-	pom, err = fetchRemotePOM(g, a, v)
-	if err != nil {
-		return nil, err
-	}
-	_ = savePOMToDisk(g, a, v, pom)
-	pomCache.Store(key, pom)
-	if pom == nil {
-		return nil, fmt.Errorf("no POM for %s", key)
-	}
-	if pom.GroupID == "" {
-		pom.GroupID = pom.Parent.GroupID
-	}
-	if pom.Version == "" {
-		pom.Version = pom.Parent.Version
-	}
-	_ = loadAllParents(pom, 0)
-	return pom, nil
-}
-
-func loadAllParents(p *MavenPOM, depth int) error {
-	if p.Parent.GroupID == "" || p.Parent.ArtifactID == "" || p.Parent.Version == "" {
-		return nil
-	}
-	pkey := fmt.Sprintf("%s:%s:%s", p.Parent.GroupID, p.Parent.ArtifactID, p.Parent.Version)
-	if _, visited := parentVisit.Load(pkey); visited {
-		return fmt.Errorf("detected parent cycle: %s", pkey)
-	}
-	parentVisit.Store(pkey, true)
-	parentPOM, err := retrieveOrLoadPOM(p.Parent.GroupID, p.Parent.ArtifactID, p.Parent.Version)
-	if err != nil {
-		return err
-	}
-	p.DependencyMgmt.Dependencies = mergeDepMgmt(parentPOM.DependencyMgmt.Dependencies, p.DependencyMgmt.Dependencies)
-	if p.GroupID == "" {
-		p.GroupID = parentPOM.GroupID
-	}
-	if p.Version == "" {
-		p.Version = parentPOM.Version
-	}
-	return loadAllParents(parentPOM, depth+1)
-}
-
-func fetchRemotePOM(g, a, v string) (*MavenPOM, error) {
+// getLatestVersion tries to fetch the latest version from Maven Central or Google Maven.
+func getLatestVersion(g, a string) (string, error) {
 	groupPath := strings.ReplaceAll(g, ".", "/")
-	urlCentral := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
-	urlGoogle := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, a, v, a, v)
-	if pm, err := fetchPOMFromURL(urlCentral); err == nil && pm != nil {
-		return pm, nil
+	mavenURL := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/maven-metadata.xml", groupPath, a)
+	version, err := fetchLatestVersionFromURL(mavenURL)
+	if err == nil && version != "" {
+		return version, nil
 	}
-	if pm, err := fetchPOMFromURL(urlGoogle); err == nil && pm != nil {
-		return pm, nil
+	googleURL := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/maven-metadata.xml", groupPath, a)
+	version, err = fetchLatestVersionFromURL(googleURL)
+	if err == nil && version != "" {
+		return version, nil
 	}
-	return nil, fmt.Errorf("could not fetch remote POM for %s:%s:%s", g, a, v)
+	return "", fmt.Errorf("could not resolve version for %s:%s", g, a)
 }
 
-func fetchPOMFromURL(url string) (*MavenPOM, error) {
-	client := http.Client{Timeout: fetchTimeout}
+// fetchLatestVersionFromURL parses maven-metadata.xml to find the latest version.
+func fetchLatestVersionFromURL(url string) (string, error) {
+	client := http.Client{Timeout: 15 * time.Second}
 	resp, err := client.Get(url)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
+		return "", fmt.Errorf("HTTP %d for %s", resp.StatusCode, url)
 	}
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-	var pom MavenPOM
-	dec := xml.NewDecoder(bytes.NewReader(data))
-	dec.Strict = false
-	if err := dec.Decode(&pom); err != nil {
-		return nil, err
+
+	type Versioning struct {
+		Latest   string   `xml:"latest"`
+		Release  string   `xml:"release"`
+		Versions []string `xml:"versions>version"`
 	}
-	return &pom, nil
+	type Metadata struct {
+		GroupID    string     `xml:"groupId"`
+		ArtifactID string     `xml:"artifactId"`
+		Versioning Versioning `xml:"versioning"`
+	}
+	var md Metadata
+	if err := xml.Unmarshal(data, &md); err != nil {
+		return "", err
+	}
+	if md.Versioning.Release != "" {
+		return md.Versioning.Release, nil
+	}
+	if md.Versioning.Latest != "" {
+		return md.Versioning.Latest, nil
+	}
+	if len(md.Versioning.Versions) > 0 {
+		return md.Versioning.Versions[len(md.Versioning.Versions)-1], nil
+	}
+	return "", fmt.Errorf("no version found in metadata at %s", url)
 }
 
-func loadPOMFromDisk(g, a, v string) (*MavenPOM, error) {
-	path := localCachePath(g, a, v)
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-	var pom MavenPOM
-	dec := xml.NewDecoder(bytes.NewReader(data))
-	dec.Strict = false
-	if err := dec.Decode(&pom); err != nil {
-		return nil, err
-	}
-	return &pom, nil
-}
+// -----------------------------------------------------------------------
+// STEP 1: FIND & PARSE build.gradle
+// -----------------------------------------------------------------------
 
-func savePOMToDisk(g, a, v string, pom *MavenPOM) error {
-	path := localCachePath(g, a, v)
-	if err := os.MkdirAll(filepath.Dir(path), 0755); err != nil {
-		return err
-	}
-	f, err := os.Create(path)
-	if err != nil {
-		return err
-	}
-	defer f.Close()
-	out, err := xml.MarshalIndent(pom, "", "  ")
-	if err != nil {
-		return err
-	}
-	_, err = f.Write(out)
-	return err
-}
-
-func localCachePath(g, a, v string) string {
-	groupPath := strings.ReplaceAll(g, ".", "/")
-	return filepath.Join(localPOMCacheDir, groupPath, a, v, fmt.Sprintf("%s-%s.pom.xml", a, v))
-}
-
-func mergeDepMgmt(parent, child []POMDep) []POMDep {
-	outMap := make(map[string]POMDep)
-	for _, d := range parent {
-		key := d.GroupID + ":" + d.ArtifactID
-		outMap[key] = d
-	}
-	for _, d := range child {
-		key := d.GroupID + ":" + d.ArtifactID
-		outMap[key] = d
-	}
-	var merged []POMDep
-	for _, val := range outMap {
-		merged = append(merged, val)
-	}
-	sort.Slice(merged, func(i, j int) bool {
-		return merged[i].GroupID < merged[j].GroupID
+// findBuildGradleFiles walks the dir to find build.gradle files.
+func findBuildGradleFiles(root string) ([]string, error) {
+	var files []string
+	err := filepath.Walk(root, func(path string, info os.FileInfo, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if !info.IsDir() && strings.EqualFold(info.Name(), "build.gradle") {
+			files = append(files, path)
+		}
+		return nil
 	})
-	return merged
+	return files, err
+}
+
+// parseVariables extracts variable definitions (like def kotlinVersion = "1.4.10") from build.gradle.
+func parseVariables(content string) map[string]string {
+	varMap := make(map[string]string)
+	reVar := regexp.MustCompile(`(?m)^\s*def\s+(\w+)\s*=\s*["']([^"']+)["']`)
+	all := reVar.FindAllStringSubmatch(content, -1)
+	for _, m := range all {
+		varMap[m[1]] = m[2]
+	}
+	return varMap
+}
+
+// parseBuildGradleFile reads one build.gradle to find dependencies and their versions.
+func parseBuildGradleFile(filePath string) (map[string]ExtendedDepInfo, error) {
+	data, err := os.ReadFile(filePath)
+	if err != nil {
+		return nil, err
+	}
+	content := string(data)
+	varMap := parseVariables(content)
+
+	deps := make(map[string]ExtendedDepInfo)
+	reDep := regexp.MustCompile(`(?m)^\s*(implementation|api|compileOnly|runtimeOnly|testImplementation|androidTestImplementation|classpath)\s+['"]([^'"]+)['"]`)
+	matches := reDep.FindAllStringSubmatch(content, -1)
+	for _, m := range matches {
+		depStr := m[2]
+		parts := strings.Split(depStr, ":")
+		if len(parts) < 2 {
+			continue
+		}
+		group := parts[0]
+		artifact := parts[1]
+		version := "unknown"
+		if len(parts) >= 3 {
+			version = parseVersionRange(parts[2])
+			// check for variable interpolation
+			if strings.Contains(version, "${") {
+				reInter := regexp.MustCompile(`\$\{([^}]+)\}`)
+				version = reInter.ReplaceAllStringFunc(version, func(s string) string {
+					inner := s[2 : len(s)-1]
+					if val, ok := varMap[inner]; ok {
+						return val
+					}
+					return ""
+				})
+				if version == "" {
+					version = "unknown"
+				}
+			}
+		}
+		// Unique key: "group/artifact@version"
+		key := fmt.Sprintf("%s@%s", group+"/"+artifact, version)
+		deps[key] = ExtendedDepInfo{
+			Display: version,
+			Lookup:  version,
+			Parent:  "direct",
+		}
+	}
+	return deps, nil
+}
+
+// parseAllBuildGradleFiles processes each build.gradle file and returns sections.
+func parseAllBuildGradleFiles(files []string) ([]GradleReportSection, error) {
+	var sections []GradleReportSection
+	for _, f := range files {
+		fmt.Printf("Parsing file: %s\n", f)
+		directDeps, err := parseBuildGradleFile(f)
+		if err != nil {
+			fmt.Printf("Error parsing %s: %v\n", f, err)
+			continue
+		}
+		sections = append(sections, GradleReportSection{
+			FilePath:     f,
+			Dependencies: directDeps,
+		})
+	}
+	return sections, nil
 }
 
 // -----------------------------------------------------------------------
-// BFS: Build Transitive Closure & Flat Map
+// STEP 2: BFS + MULTI-LEVEL PARENT
 // -----------------------------------------------------------------------
 
+// buildTransitiveClosure does BFS to find transitive dependencies, build the tree, fill flat map.
 func buildTransitiveClosure(sections []GradleReportSection) {
 	for i := range sections {
 		sec := &sections[i]
 		fmt.Printf("Building transitive closure for %s\n", sec.FilePath)
+
+		// We keep a BFS state map, a node map, and a new "flatDeps"
 		stateMap := make(map[string]depState)
 		nodeMap := make(map[string]*GradleDependencyNode)
 		flatDeps := make(map[string]ExtendedDepInfo)
 
-		// Initialize flatDeps with direct dependencies.
+		// Copy direct dependencies into flatDeps.
 		for k, v := range sec.Dependencies {
 			flatDeps[k] = v
 		}
+
 		var rootNodes []*GradleDependencyNode
 		var queue []queueItem
-		visitedBFS := make(map[string]bool)
+		visited := make(map[string]bool)
 
-		// Initialize BFS with direct dependencies.
+		// Initialize BFS queue with direct deps.
 		for depKey, info := range sec.Dependencies {
-			visitedBFS[depKey] = true
+			visited[depKey] = true
 			parts := strings.Split(depKey, "@")
 			if len(parts) != 2 {
 				continue
@@ -545,16 +361,16 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 			})
 		}
 
-		// Process BFS queue.
+		// BFS
 		for len(queue) > 0 {
 			it := queue[0]
 			queue = queue[1:]
-			fmt.Printf("BFS: Processing %s (depth %d)\n", it.GroupArtifact, it.Depth)
 			gid, aid := splitGA(it.GroupArtifact)
 			if gid == "" || aid == "" {
 				continue
 			}
-			if strings.Contains(it.Version, "${") || strings.ToLower(it.Version) == "unknown" {
+			// If version unknown, getLatestVersion
+			if strings.ToLower(it.Version) == "unknown" || strings.Contains(it.Version, "${") {
 				latest, err := getLatestVersion(gid, aid)
 				if err != nil {
 					it.Version = "unknown"
@@ -566,11 +382,14 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 			if err != nil || pom == nil {
 				continue
 			}
+
+			// Attach BFS node license
 			if it.ParentNode != nil {
 				licName := detectLicense(pom)
 				it.ParentNode.License = licName
 				it.ParentNode.Copyleft = isCopyleft(licName)
 			}
+
 			managed := parseManagedVersions(pom)
 			for _, d := range pom.Dependencies {
 				if skipScope(d.Scope, d.Optional) {
@@ -579,11 +398,12 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 				childGA := d.GroupID + "/" + d.ArtifactID
 				cv := parseVersionRange(d.Version)
 				if cv == "" || strings.Contains(cv, "${") {
+					// fallback to managed or latest
 					if mv, ok := managed[childGA]; ok && mv != "" {
 						cv = mv
 					} else {
-						latest, err := getLatestVersion(d.GroupID, d.ArtifactID)
-						if err != nil {
+						latest, err2 := getLatestVersion(d.GroupID, d.ArtifactID)
+						if err2 != nil {
 							continue
 						}
 						cv = latest
@@ -594,11 +414,11 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 				}
 				childDepth := it.Depth + 1
 				childKey := fmt.Sprintf("%s@%s", childGA, cv)
-				if _, found := visitedBFS[childKey]; found {
+				if _, found := visited[childKey]; found {
 					continue
 				}
-				visitedBFS[childKey] = true
-				_, seen := stateMap[childKey]
+				visited[childKey] = true
+				curSt, seen := stateMap[childKey]
 				if !seen {
 					stateMap[childKey] = depState{Version: cv, Depth: childDepth}
 					childNode := &GradleDependencyNode{
@@ -607,6 +427,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 						Parent:  fmt.Sprintf("%s:%s", it.GroupArtifact, it.Version),
 					}
 					nodeMap[childKey] = childNode
+					// Add to flatDeps
 					flatDeps[childKey] = ExtendedDepInfo{
 						Display: cv,
 						Lookup:  cv,
@@ -621,10 +442,9 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 						Depth:         childDepth,
 						ParentNode:    childNode,
 					})
-					fmt.Printf("BFS: Added %s (depth %d)\n", childKey, childDepth)
 				} else {
-					current := stateMap[childKey]
-					if childDepth < current.Depth {
+					// conflict resolution
+					if childDepth < curSt.Depth {
 						stateMap[childKey] = depState{Version: cv, Depth: childDepth}
 						childNode, ok := nodeMap[childKey]
 						if !ok {
@@ -651,7 +471,8 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 				}
 			}
 		}
-		// Fill flat dependency map from the BFS tree.
+
+		// fill final map from BFS tree
 		for _, rn := range rootNodes {
 			fillDepMap(rn, flatDeps)
 		}
@@ -659,7 +480,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 		sortRoots(rootNodes)
 		sec.DependencyTree = rootNodes
 
-		// Compute transitive count as total nodes minus direct ones.
+		// compute a basic transitive count
 		totalNodes := 0
 		for _, rn := range rootNodes {
 			totalNodes += countNodes(rn)
@@ -675,7 +496,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 }
 
 // -----------------------------------------------------------------------
-// PRECOMPUTE LICENSE INFO (after BFS)
+// PRECOMPUTE LICENSE INFO (AFTER BFS)
 // -----------------------------------------------------------------------
 
 func precomputeLicenseInfo(sections []GradleReportSection) {
@@ -718,7 +539,7 @@ func precomputeLicenseInfo(sections []GradleReportSection) {
 }
 
 // -----------------------------------------------------------------------
-// COMPUTE SUMMARY METRICS (after license precomputation)
+// COMPUTE SUMMARY METRICS (AFTER LICENSE INFO)
 // -----------------------------------------------------------------------
 
 func computeSummary(sections []GradleReportSection) {
@@ -746,7 +567,7 @@ func computeSummary(sections []GradleReportSection) {
 }
 
 // -----------------------------------------------------------------------
-// HTML REPORT & CONSOLE REPORT
+// BUILD GRADLE TREE HTML
 // -----------------------------------------------------------------------
 
 func buildGradleTreeHTML(node *GradleDependencyNode, level int) string {
@@ -774,6 +595,10 @@ func buildGradleTreesHTML(nodes []*GradleDependencyNode) template.HTML {
 	}
 	return template.HTML(buf.String())
 }
+
+// -----------------------------------------------------------------------
+// GENERATE HTML
+// -----------------------------------------------------------------------
 
 func generateHTMLReport(sections []GradleReportSection) error {
 	outDir := "./license-checker"
@@ -892,7 +717,7 @@ func printConsoleReport(sections []GradleReportSection) {
 	fmt.Println("----- Console Dependency Report -----")
 	for _, sec := range sections {
 		fmt.Printf("File: %s\n", sec.FilePath)
-		fmt.Printf("Direct Dependencies: %d, Indirect: %d, Copyleft: %d, Unknown: %d\n",
+		fmt.Printf("Direct: %d, Indirect: %d, Copyleft: %d, Unknown: %d\n",
 			sec.DirectCount, sec.IndirectCount, sec.CopyleftCount, sec.UnknownCount)
 		fmt.Println("Flat Dependencies:")
 		var keys []string
@@ -921,11 +746,23 @@ func printTreeNode(node *GradleDependencyNode, indent int) {
 }
 
 // -----------------------------------------------------------------------
-// MAIN FUNCTION
+// WORKER POOL
+// -----------------------------------------------------------------------
+
+func pomFetchWorker() {
+	defer wgWorkers.Done()
+	for req := range pomRequests {
+		pom, err := retrieveOrLoadPOM(req.GroupID, req.ArtifactID, req.Version)
+		req.ResultChan <- fetchResult{POM: pom, Err: err}
+	}
+}
+
+// -----------------------------------------------------------------------
+// MAIN
 // -----------------------------------------------------------------------
 
 func main() {
-	// Start worker pool.
+	// Start worker pool
 	for i := 0; i < pomWorkerCount; i++ {
 		wgWorkers.Add(1)
 		go pomFetchWorker()
@@ -949,25 +786,27 @@ func main() {
 	fmt.Println("Starting transitive dependency resolution...")
 	buildTransitiveClosure(sections)
 
-	// Close channel and wait for workers.
+	// Mark channel closed, wait for workers
 	channelMutex.Lock()
 	channelOpen = false
 	channelMutex.Unlock()
 	close(pomRequests)
 	wgWorkers.Wait()
 
-	// Precompute license info AFTER BFS.
+	// Precompute license info after BFS
 	precomputeLicenseInfo(sections)
 
-	// Compute summary metrics AFTER license info is updated.
+	// Compute summary metrics
 	computeSummary(sections)
 
+	// Generate HTML
 	fmt.Println("Generating HTML report...")
 	if err := generateHTMLReport(sections); err != nil {
 		fmt.Printf("Error generating HTML report: %v\n", err)
 		os.Exit(1)
 	}
 
+	// Print console
 	fmt.Println("Printing console report...")
 	printConsoleReport(sections)
 	fmt.Println("Analysis complete.")
