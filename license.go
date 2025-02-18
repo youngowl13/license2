@@ -21,9 +21,9 @@ import (
 // -------------------------------------------------------------------------------------
 
 const (
-	localPOMCacheDir = ".pom-cache"     // Directory for disk caching of POMs
-	pomWorkerCount   = 10               // Number of concurrent POM fetch workers
-	// No limit on parent POM depth now
+	localPOMCacheDir = ".pom-cache"         // Directory for disk caching of POMs
+	pomWorkerCount   = 10                   // Number of concurrent POM fetch workers
+	// No limit on parent POM depth (we rely on cycle detection)
 	fetchTimeout = 30 * time.Second // HTTP request timeout
 )
 
@@ -68,13 +68,13 @@ type GradleDependencyNode struct {
 	Version    string
 	License    string
 	Copyleft   bool
-	Parent     string // "direct" for direct dependencies or parent's GAV for transitive dependencies.
+	Parent     string // "direct" for direct deps or parent's GAV for transitive deps.
 	Transitive []*GradleDependencyNode
 }
 
 // ExtendedDepInfo holds info for the flat dependency table.
 type ExtendedDepInfo struct {
-	Display           string // What to display ("version not available" if not provided in file)
+	Display           string // What to display ("version not available" if unresolved)
 	Lookup            string // The version as parsed from file (may be "unknown")
 	Parent            string // "direct" or parent's GAV
 	License           string // Precomputed license name
@@ -355,6 +355,11 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 		fmt.Printf("Building transitive closure for file: %s\n", sec.FilePath)
 		stateMap := make(map[string]depState)
 		nodeMap := make(map[string]*GradleDependencyNode)
+		// We'll start with a copy of the parsed dependencies (direct deps).
+		flatDeps := make(map[string]ExtendedDepInfo)
+		for k, v := range sec.Dependencies {
+			flatDeps[k] = v
+		}
 		var rootNodes []*GradleDependencyNode
 		var queue []queueItem
 		visitedBFS := make(map[string]bool)
@@ -443,6 +448,12 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 						Parent:  fmt.Sprintf("%s:%s", it.GroupArtifact, it.Version),
 					}
 					nodeMap[childGA] = childNode
+					// Add to flat map.
+					flatDeps[childGA] = ExtendedDepInfo{
+						Display: cv,
+						Lookup:  cv,
+						Parent:  fmt.Sprintf("%s:%s", it.GroupArtifact, it.Version),
+					}
 					if it.ParentNode != nil {
 						it.ParentNode.Transitive = append(it.ParentNode.Transitive, childNode)
 					}
@@ -482,10 +493,11 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 				}
 			}
 		}
-		// Populate the flat dependency map with all dependencies from the tree.
+		// Populate the flat dependency map with all nodes from the tree.
 		for _, rn := range rootNodes {
-			fillDepMap(rn, sec.Dependencies)
+			fillDepMap(rn, flatDeps)
 		}
+		sec.Dependencies = flatDeps
 		sortRoots(rootNodes)
 		sec.DependencyTree = rootNodes
 		total := 0
@@ -493,21 +505,20 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 			total += countNodes(rn)
 		}
 		direct := 0
-		// Count direct ones: those whose ExtendedDepInfo.Parent == "direct"
 		for _, info := range sec.Dependencies {
 			if info.Parent == "direct" {
 				direct++
 			}
 		}
 		sec.TransitiveCount = total - direct
-		// For dependencies that did not have literal version info in the file, mark display as "version not available"
+		// For dependencies without literal version info, mark display as "version not available"
 		for key, info := range sec.Dependencies {
 			if strings.Contains(info.Lookup, "${") || strings.ToLower(info.Lookup) == "unknown" {
 				info.Display = "version not available"
 				sec.Dependencies[key] = info
 			}
 		}
-		// Compute summary metrics: direct, indirect, copyleft, unknown
+		// Compute summary metrics.
 		var directCount, indirectCount, copyleftCount, unknownCount int
 		for _, info := range sec.Dependencies {
 			if info.Parent == "direct" {
@@ -527,7 +538,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 		sec.CopyleftCount = copyleftCount
 		sec.UnknownCount = unknownCount
 
-		fmt.Printf("Finished processing %s: %d direct, %d transitive dependencies found.\n", sec.FilePath, len(sec.Dependencies), sec.TransitiveCount)
+		fmt.Printf("Finished processing %s: %d total dependencies (%d direct, %d indirect) found.\n", sec.FilePath, len(sec.Dependencies), directCount, indirectCount)
 	}
 }
 
@@ -591,8 +602,8 @@ func countNodes(n *GradleDependencyNode) int {
 	return count
 }
 
+// fillDepMap recursively adds the node and its children into depMap.
 func fillDepMap(n *GradleDependencyNode, depMap map[string]ExtendedDepInfo) {
-	// Update (or add) this node to the flat map.
 	if info, exists := depMap[n.Name]; exists {
 		info.Display = n.Version
 		info.Lookup = n.Version
@@ -897,7 +908,7 @@ func precomputeLicenseInfo(sections []GradleReportSection) {
 				continue
 			}
 			g, a := parts[0], parts[1]
-			// If version was not provided in the file, mark as "version not available" and use a Google search.
+			// If the version was not provided in the file, mark as "version not available" and use a Google search.
 			if strings.Contains(info.Lookup, "${") || strings.ToLower(info.Lookup) == "unknown" {
 				info.License = "Unknown"
 				info.LicenseProjectURL = fmt.Sprintf("https://www.google.com/search?q=%s+%s+license", g, a)
@@ -1099,7 +1110,7 @@ func printTreeNode(node *GradleDependencyNode, indent int) {
 // -------------------------------------------------------------------------------------
 
 func main() {
-	// Start worker pool.
+	// Start the worker pool.
 	for i := 0; i < pomWorkerCount; i++ {
 		wgWorkers.Add(1)
 		go pomFetchWorker()
@@ -1126,29 +1137,7 @@ func main() {
 	close(pomRequests)
 	wgWorkers.Wait()
 
-	// Compute summary metrics for each section.
-	for idx := range sections {
-		sec := &sections[idx]
-		var directCount, indirectCount, copyleftCount, unknownCount int
-		for _, info := range sec.Dependencies {
-			if info.Parent == "direct" {
-				directCount++
-			} else {
-				indirectCount++
-			}
-			if isCopyleft(info.License) {
-				copyleftCount++
-			}
-			if info.License == "Unknown" {
-				unknownCount++
-			}
-		}
-		sec.DirectCount = directCount
-		sec.IndirectCount = indirectCount
-		sec.CopyleftCount = copyleftCount
-		sec.UnknownCount = unknownCount
-	}
-
+	// Generate summary metrics for each section are already computed in buildTransitiveClosure.
 	fmt.Println("Generating HTML report...")
 	if err := generateHTMLReport(sections); err != nil {
 		fmt.Printf("Error generating HTML report: %v\n", err)
