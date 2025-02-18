@@ -23,7 +23,7 @@ import (
 const (
 	localPOMCacheDir = ".pom-cache"         // Directory for disk caching of POMs
 	pomWorkerCount   = 10                   // Number of concurrent POM fetch workers
-	// No limit on parent POM depth (we rely on cycle detection)
+	// No limit on parent POM depth (cycle detection is used instead)
 	fetchTimeout = 30 * time.Second // HTTP request timeout
 )
 
@@ -68,14 +68,14 @@ type GradleDependencyNode struct {
 	Version    string
 	License    string
 	Copyleft   bool
-	Parent     string // "direct" for direct deps or parent's GAV for transitive deps.
+	Parent     string // "direct" for direct dependencies or parent's GAV for transitive dependencies.
 	Transitive []*GradleDependencyNode
 }
 
 // ExtendedDepInfo holds info for the flat dependency table.
 type ExtendedDepInfo struct {
 	Display           string // What to display ("version not available" if unresolved)
-	Lookup            string // The version as parsed from file (may be "unknown")
+	Lookup            string // Version as parsed from file (may be "unknown")
 	Parent            string // "direct" or parent's GAV
 	License           string // Precomputed license name
 	LicenseProjectURL string // URL for project details (or Google search URL if unresolved)
@@ -355,7 +355,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 		fmt.Printf("Building transitive closure for file: %s\n", sec.FilePath)
 		stateMap := make(map[string]depState)
 		nodeMap := make(map[string]*GradleDependencyNode)
-		// We'll start with a copy of the parsed dependencies (direct deps).
+		// Start with a copy of the parsed (direct) dependencies.
 		flatDeps := make(map[string]ExtendedDepInfo)
 		for k, v := range sec.Dependencies {
 			flatDeps[k] = v
@@ -390,7 +390,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 			if gid == "" || aid == "" {
 				continue
 			}
-			// Only do dynamic lookup if no literal version was provided.
+			// If version is unresolved, try to look up latest.
 			if strings.Contains(it.Version, "${") || strings.ToLower(it.Version) == "unknown" {
 				latest, err := getLatestVersion(gid, aid)
 				if err != nil {
@@ -504,13 +504,14 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 		for _, rn := range rootNodes {
 			total += countNodes(rn)
 		}
-		direct := 0
+		// Compute direct count (those with Parent == "direct")
+		directCount := 0
 		for _, info := range sec.Dependencies {
 			if info.Parent == "direct" {
-				direct++
+				directCount++
 			}
 		}
-		sec.TransitiveCount = total - direct
+		sec.TransitiveCount = total - directCount
 		// For dependencies without literal version info, mark display as "version not available"
 		for key, info := range sec.Dependencies {
 			if strings.Contains(info.Lookup, "${") || strings.ToLower(info.Lookup) == "unknown" {
@@ -519,11 +520,9 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 			}
 		}
 		// Compute summary metrics.
-		var directCount, indirectCount, copyleftCount, unknownCount int
+		var indirectCount, copyleftCount, unknownCount int
 		for _, info := range sec.Dependencies {
-			if info.Parent == "direct" {
-				directCount++
-			} else {
+			if info.Parent != "direct" {
 				indirectCount++
 			}
 			if isCopyleft(info.License) {
@@ -908,7 +907,7 @@ func precomputeLicenseInfo(sections []GradleReportSection) {
 				continue
 			}
 			g, a := parts[0], parts[1]
-			// If the version was not provided in the file, mark as "version not available" and use a Google search.
+			// If version was not provided, mark license as Unknown and use a Google search.
 			if strings.Contains(info.Lookup, "${") || strings.ToLower(info.Lookup) == "unknown" {
 				info.License = "Unknown"
 				info.LicenseProjectURL = fmt.Sprintf("https://www.google.com/search?q=%s+%s+license", g, a)
@@ -1137,7 +1136,29 @@ func main() {
 	close(pomRequests)
 	wgWorkers.Wait()
 
-	// Generate summary metrics for each section are already computed in buildTransitiveClosure.
+	// Compute summary metrics for each section.
+	for idx := range sections {
+		sec := &sections[idx]
+		var directCount, indirectCount, copyleftCount, unknownCount int
+		for _, info := range sec.Dependencies {
+			if info.Parent == "direct" {
+				directCount++
+			} else {
+				indirectCount++
+			}
+			if isCopyleft(info.License) {
+				copyleftCount++
+			}
+			if info.License == "Unknown" {
+				unknownCount++
+			}
+		}
+		sec.DirectCount = directCount
+		sec.IndirectCount = indirectCount
+		sec.CopyleftCount = copyleftCount
+		sec.UnknownCount = unknownCount
+	}
+
 	fmt.Println("Generating HTML report...")
 	if err := generateHTMLReport(sections); err != nil {
 		fmt.Printf("Error generating HTML report: %v\n", err)
