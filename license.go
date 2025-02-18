@@ -23,7 +23,7 @@ import (
 const (
 	localPOMCacheDir = ".pom-cache"         // Directory for disk caching of POMs
 	pomWorkerCount   = 10                   // Number of concurrent POM fetch workers
-	// No limit on parent POM depth (cycle detection is used instead)
+	// No limit on parent POM depth (we rely on cycle detection)
 	fetchTimeout = 30 * time.Second // HTTP request timeout
 )
 
@@ -68,14 +68,14 @@ type GradleDependencyNode struct {
 	Version    string
 	License    string
 	Copyleft   bool
-	Parent     string // "direct" for direct deps or parent's GAV for transitive deps.
+	Parent     string // "direct" for direct dependencies or parent's GAV for transitive dependencies.
 	Transitive []*GradleDependencyNode
 }
 
 // ExtendedDepInfo holds info for the flat dependency table.
 type ExtendedDepInfo struct {
 	Display           string // What to display ("version not available" if unresolved)
-	Lookup            string // Version as parsed from file (may be "unknown")
+	Lookup            string // The version as parsed from file (may be "unknown")
 	Parent            string // "direct" or parent's GAV
 	License           string // Precomputed license name
 	LicenseProjectURL string // URL for project details (or Google search URL if unresolved)
@@ -240,7 +240,7 @@ func parseBuildGradleFile(filePath string) (map[string]ExtendedDepInfo, error) {
 				}
 			}
 		}
-		// Use a unique key: group/artifact@version
+		// Use a unique key: "group/artifact@version"
 		key := fmt.Sprintf("%s@%s", group+"/"+artifact, version)
 		deps[key] = ExtendedDepInfo{
 			Display: version,
@@ -356,7 +356,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 		fmt.Printf("Building transitive closure for file: %s\n", sec.FilePath)
 		stateMap := make(map[string]depState)
 		nodeMap := make(map[string]*GradleDependencyNode)
-		// Use a flat map with unique keys (group/artifact@version)
+		// Use a flat map with unique keys ("group/artifact@version")
 		flatDeps := make(map[string]ExtendedDepInfo)
 		// Initialize flatDeps with direct dependencies.
 		for k, v := range sec.Dependencies {
@@ -368,9 +368,14 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 		// Initialize BFS with direct dependencies.
 		for depKey, info := range sec.Dependencies {
 			visitedBFS[depKey] = true
+			// Split key into group/artifact and version.
+			parts := strings.Split(depKey, "@")
+			if len(parts) != 2 {
+				continue
+			}
+			ga := parts[0]
 			n := &GradleDependencyNode{
-				// The key is already group/artifact@version; split out the group/artifact part.
-				Name:    strings.Split(depKey, "@")[0],
+				Name:    ga,
 				Version: info.Lookup,
 				Parent:  "direct",
 			}
@@ -378,7 +383,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 			nodeMap[depKey] = n
 			stateMap[depKey] = depState{Version: info.Lookup, Depth: 1}
 			queue = append(queue, queueItem{
-				GroupArtifact: strings.Split(depKey, "@")[0],
+				GroupArtifact: ga,
 				Version:       info.Lookup,
 				Depth:         1,
 				ParentNode:    n,
@@ -393,6 +398,7 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 			if gid == "" || aid == "" {
 				continue
 			}
+			// If version unresolved, try dynamic lookup.
 			if strings.Contains(it.Version, "${") || strings.ToLower(it.Version) == "unknown" {
 				latest, err := getLatestVersion(gid, aid)
 				if err != nil {
@@ -437,7 +443,6 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 					continue
 				}
 				childDepth := it.Depth + 1
-				// Create a unique key for the child dependency.
 				childKey := fmt.Sprintf("%s@%s", childGA, cv)
 				if _, found := visitedBFS[childKey]; found {
 					continue
@@ -508,16 +513,11 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 		for _, rn := range rootNodes {
 			total += countNodes(rn)
 		}
-		// Compute direct count (those whose key contains "@unknown" or whose Parent is "direct")
+		// Compute direct count.
 		directCount := 0
 		for key, info := range sec.Dependencies {
-			if info.Parent == "direct" {
+			if info.Parent == "direct" || strings.HasSuffix(key, "@unknown") {
 				directCount++
-			} else {
-				// Alternatively, if key ends with "@unknown"
-				if strings.HasSuffix(key, "@unknown") {
-					directCount++
-				}
 			}
 		}
 		sec.TransitiveCount = total - directCount
@@ -610,7 +610,7 @@ func countNodes(n *GradleDependencyNode) int {
 	return count
 }
 
-// fillDepMap recursively adds the node and its children into depMap using a unique key.
+// fillDepMap recursively adds the node and its children into depMap using unique keys.
 func fillDepMap(n *GradleDependencyNode, depMap map[string]ExtendedDepInfo) {
 	key := fmt.Sprintf("%s@%s", n.Name, n.Version)
 	if info, exists := depMap[key]; exists {
@@ -768,7 +768,7 @@ func retrieveOrLoadPOM(g, a, v string) (*MavenPOM, error) {
 }
 
 func loadAllParents(p *MavenPOM, depth int) error {
-	// No depth limit now.
+	// No depth limit.
 	if p.Parent.GroupID == "" || p.Parent.ArtifactID == "" || p.Parent.Version == "" {
 		return nil
 	}
@@ -910,7 +910,7 @@ func localCachePath(g, a, v string) string {
 func precomputeLicenseInfo(sections []GradleReportSection) {
 	for idx := range sections {
 		sec := &sections[idx]
-		// For each dependency key, which is in the form "group/artifact@version"
+		// For each dependency key in the form "group/artifact@version"
 		for dep, info := range sec.Dependencies {
 			parts := strings.Split(dep, "@")
 			if len(parts) != 2 {
@@ -935,6 +935,8 @@ func precomputeLicenseInfo(sections []GradleReportSection) {
 					info.LicensePomURL = ""
 				} else {
 					lic := detectLicense(pom)
+					// For debugging, print out the license computed for this dependency.
+					fmt.Printf("Precompute: Dependency %s: License computed as '%s'\n", dep, lic)
 					info.License = lic
 					groupPath := strings.ReplaceAll(g, ".", "/")
 					info.LicenseProjectURL = fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/", groupPath, a, info.Lookup)
