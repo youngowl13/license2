@@ -23,7 +23,7 @@ import (
 const (
 	localPOMCacheDir = ".pom-cache"         // Directory for disk caching of POMs
 	pomWorkerCount   = 10                   // Number of concurrent POM fetch workers
-	// No limit on parent POM depth (we rely on cycle detection)
+	// No limit on parent POM depth (cycle detection is used instead)
 	fetchTimeout = 30 * time.Second // HTTP request timeout
 )
 
@@ -68,7 +68,7 @@ type GradleDependencyNode struct {
 	Version    string
 	License    string
 	Copyleft   bool
-	Parent     string // "direct" for direct dependencies or parent's GAV for transitive dependencies.
+	Parent     string // "direct" for direct deps or parent's GAV for transitive deps.
 	Transitive []*GradleDependencyNode
 }
 
@@ -368,7 +368,6 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 		// Initialize BFS with direct dependencies.
 		for depKey, info := range sec.Dependencies {
 			visitedBFS[depKey] = true
-			// Split key into group/artifact and version.
 			parts := strings.Split(depKey, "@")
 			if len(parts) != 2 {
 				continue
@@ -398,7 +397,6 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 			if gid == "" || aid == "" {
 				continue
 			}
-			// If version unresolved, try dynamic lookup.
 			if strings.Contains(it.Version, "${") || strings.ToLower(it.Version) == "unknown" {
 				latest, err := getLatestVersion(gid, aid)
 				if err != nil {
@@ -457,7 +455,6 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 						Parent:  fmt.Sprintf("%s:%s", it.GroupArtifact, it.Version),
 					}
 					nodeMap[childKey] = childNode
-					// Add to flat map.
 					flatDeps[childKey] = ExtendedDepInfo{
 						Display: cv,
 						Lookup:  cv,
@@ -527,6 +524,11 @@ func buildTransitiveClosure(sections []GradleReportSection) {
 				info.Display = "version not available"
 				sec.Dependencies[key] = info
 			}
+		}
+		// --- DEBUG: Print all dependency license values ---
+		fmt.Println("DEBUG: License values for dependencies:")
+		for key, info := range sec.Dependencies {
+			fmt.Printf("  %s: License='%s'\n", key, info.License)
 		}
 		// Compute summary metrics.
 		var indirectCount, copyleftCount, unknownCount int
@@ -910,7 +912,7 @@ func localCachePath(g, a, v string) string {
 func precomputeLicenseInfo(sections []GradleReportSection) {
 	for idx := range sections {
 		sec := &sections[idx]
-		// For each dependency key in the form "group/artifact@version"
+		// For each dependency key (format "group/artifact@version")
 		for dep, info := range sec.Dependencies {
 			parts := strings.Split(dep, "@")
 			if len(parts) != 2 {
@@ -922,7 +924,6 @@ func precomputeLicenseInfo(sections []GradleReportSection) {
 				continue
 			}
 			g, a := gaParts[0], gaParts[1]
-			// If version was not provided in the file, mark license as Unknown and use Google search.
 			if strings.Contains(info.Lookup, "${") || strings.ToLower(info.Lookup) == "unknown" {
 				info.License = "Unknown"
 				info.LicenseProjectURL = fmt.Sprintf("https://www.google.com/search?q=%s+%s+license", g, a)
@@ -935,8 +936,8 @@ func precomputeLicenseInfo(sections []GradleReportSection) {
 					info.LicensePomURL = ""
 				} else {
 					lic := detectLicense(pom)
-					// For debugging, print out the license computed for this dependency.
-					fmt.Printf("Precompute: Dependency %s: License computed as '%s'\n", dep, lic)
+					// Debug print for each dependency's license value.
+					fmt.Printf("Precompute: %s -> License: '%s'\n", dep, lic)
 					info.License = lic
 					groupPath := strings.ReplaceAll(g, ".", "/")
 					info.LicenseProjectURL = fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/", groupPath, a, info.Lookup)
@@ -975,7 +976,6 @@ func buildGradleTreesHTML(nodes []*GradleDependencyNode) template.HTML {
 }
 
 func generateHTMLReport(sections []GradleReportSection) error {
-	// Precompute license info.
 	precomputeLicenseInfo(sections)
 	outDir := "./license-checker"
 	if err := os.MkdirAll(outDir, 0755); err != nil {
