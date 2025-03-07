@@ -40,6 +40,7 @@ var (
 // 2) COMMON TYPES FOR DEPENDENCY TREES & REPORTS
 // ----------------------------------------------------------------------
 
+// DependencyNode represents a dependency in the BFS tree.
 type DependencyNode struct {
 	Name       string
 	Version    string
@@ -51,6 +52,7 @@ type DependencyNode struct {
 	Direct     string            // Top-level dependency that introduced this node
 }
 
+// ExtendedDep holds flattened info.
 type ExtendedDep struct {
 	Display      string
 	Lookup       string
@@ -60,6 +62,7 @@ type ExtendedDep struct {
 	PomURL       string
 }
 
+// ReportSection holds the dependency tree and flattened table for one file.
 type ReportSection struct {
 	FilePath        string
 	DirectDeps      map[string]string // e.g. "group/artifact" => version
@@ -75,6 +78,7 @@ type ReportSection struct {
 	Flattened []FlattenedDep // Flattened table rows
 }
 
+// FlattenedDep represents one row in the final table.
 type FlattenedDep struct {
 	Dependency string
 	Version    string
@@ -85,12 +89,14 @@ type FlattenedDep struct {
 	Details    string // Link (Maven POM or Node/Python details)
 }
 
+// introducerSet is used during BFS bookkeeping.
 type introducerSet map[string]bool
 
 // ----------------------------------------------------------------------
 // 3) TYPES FOR MAVEN FETCHING
 // ----------------------------------------------------------------------
 
+// fetchRequest is used to enqueue remote fetch requests.
 type fetchRequest struct {
 	GroupID    string
 	ArtifactID string
@@ -98,6 +104,7 @@ type fetchRequest struct {
 	ResultChan chan fetchResult
 }
 
+// fetchResult holds the result of a remote fetch.
 type fetchResult struct {
 	POM     *MavenPOM
 	UsedURL string
@@ -796,7 +803,8 @@ func parsePythonDependencies(reqFile string) ([]*DependencyNode, error) {
 
 func parsePyRequiresDistLine(line string) (string, string) {
 	parts := strings.FieldsFunc(line, func(r rune) bool {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
 			return false
 		}
 		return true
@@ -902,26 +910,7 @@ func flattenBFS(sec *ReportSection) {
 }
 
 // ----------------------------------------------------------------------
-// 12) HELPER: dict (to pass maps to templates)
-// ----------------------------------------------------------------------
-
-func dict(values ...interface{}) map[string]interface{} {
-	if len(values)%2 != 0 {
-		panic("dict expects an even number of arguments")
-	}
-	d := make(map[string]interface{}, len(values)/2)
-	for i := 0; i < len(values); i += 2 {
-		key, ok := values[i].(string)
-		if !ok {
-			panic("dict keys must be strings")
-		}
-		d[key] = values[i+1]
-	}
-	return d
-}
-
-// ----------------------------------------------------------------------
-// 13) FINAL HTML TEMPLATE (TABLE FIRST, THEN COLLAPSIBLE BFS)
+// 12) FINAL HTML TEMPLATE (TABLE FIRST, THEN COLLAPSIBLE BFS)
 // ----------------------------------------------------------------------
 
 var finalHTML = `
@@ -1033,7 +1022,7 @@ var finalHTML = `
 `
 
 // ----------------------------------------------------------------------
-// 14) MAIN FUNCTION
+// 13) MAIN FUNCTION
 // ----------------------------------------------------------------------
 
 func main() {
@@ -1168,7 +1157,7 @@ func main() {
 	}
 	fd := finalData{Sections: sections}
 
-	// Register the "dict" function so we can pass maps to sub-templates.
+	// Register helper function "dict" in the template's function map.
 	funcMap := template.FuncMap{
 		"dict": dict,
 	}
@@ -1209,7 +1198,7 @@ func countTotalDependencies(nodes []*DependencyNode) int {
 }
 
 // ----------------------------------------------------------------------
-// 15) TEMPLATE HELPER: dict
+// 15) TEMPLATE HELPER: dict (only one declaration)
 // ----------------------------------------------------------------------
 
 func dict(values ...interface{}) map[string]interface{} {
