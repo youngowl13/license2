@@ -48,7 +48,7 @@ type DependencyNode struct {
 	Copyleft   bool
 	Parent     string            // "direct" or parent's coordinate (e.g. "group/artifact@version")
 	Transitive []*DependencyNode // Child dependencies
-	UsedPOMURL string            // For Maven: POM URL; for Node/Python: details link
+	UsedPOMURL string            // For Maven: the POM URL; for Node/Python: details link
 	Direct     string            // Top-level dependency that introduced this node
 }
 
@@ -93,7 +93,7 @@ type FlattenedDep struct {
 type introducerSet map[string]bool
 
 // ----------------------------------------------------------------------
-// 3) MAVEN FETCHING TYPES & FUNCTIONS
+// 3) TYPES FOR MAVEN FETCHING
 // ----------------------------------------------------------------------
 
 // fetchRequest is used to enqueue remote fetch requests.
@@ -111,7 +111,10 @@ type fetchResult struct {
 	Err     error
 }
 
-// Maven XML structures.
+// ----------------------------------------------------------------------
+// 4) MAVEN XML STRUCTURES & PARSING
+// ----------------------------------------------------------------------
+
 type LicenseXML struct {
 	Name string `xml:"name"`
 	URL  string `xml:"url"`
@@ -140,10 +143,9 @@ type MavenPOM struct {
 }
 
 // ----------------------------------------------------------------------
-// 4) FILE FINDING FUNCTIONS
+// 5) FILE FINDING FUNCTIONS
 // ----------------------------------------------------------------------
 
-// findAllPOMFiles returns paths to pom.xml files.
 func findAllPOMFiles(root string) ([]string, error) {
 	var files []string
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
@@ -155,7 +157,6 @@ func findAllPOMFiles(root string) ([]string, error) {
 	return files, err
 }
 
-// findAllTOMLFiles returns paths to .toml files.
 func findAllTOMLFiles(root string) ([]string, error) {
 	var files []string
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
@@ -167,7 +168,6 @@ func findAllTOMLFiles(root string) ([]string, error) {
 	return files, err
 }
 
-// findAllGradleFiles returns paths to build.gradle or build.gradle.kts files.
 func findAllGradleFiles(root string) ([]string, error) {
 	var files []string
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
@@ -182,7 +182,6 @@ func findAllGradleFiles(root string) ([]string, error) {
 	return files, err
 }
 
-// findFile returns the first file found with the given target name.
 func findFile(root, target string) string {
 	var found string
 	filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
@@ -196,7 +195,7 @@ func findFile(root, target string) string {
 }
 
 // ----------------------------------------------------------------------
-// 5) UTILITY FUNCTIONS: skipScope, splitGA, removeCaretTilde, detectLicense, isCopyleftChecker, parseVersionRange
+// 6) UTILITY FUNCTIONS
 // ----------------------------------------------------------------------
 
 func skipScope(scope, optional string) bool {
@@ -253,7 +252,7 @@ func parseVersionRange(v string) string {
 }
 
 // ----------------------------------------------------------------------
-// 6) MAVEN, TOML, GRADLE PARSING FUNCTIONS
+// 7) PARSING FUNCTIONS: MAVEN, TOML, GRADLE
 // ----------------------------------------------------------------------
 
 func parseOneLocalPOMFile(filePath string) (map[string]string, error) {
@@ -399,7 +398,7 @@ func parseGradleVariables(content string) map[string]string {
 }
 
 // ----------------------------------------------------------------------
-// 7) MAVEN BFS WORKER & FETCH FUNCTIONS
+// 8) MAVEN BFS WORKER & FETCH FUNCTIONS
 // ----------------------------------------------------------------------
 
 func pomFetchWorker() {
@@ -415,7 +414,7 @@ func fetchRemotePOM(group, artifact, version string) (*MavenPOM, string, error) 
 	urlCentral := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, artifact, version, artifact, version)
 	urlGoogle := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, artifact, version, artifact, version)
 	client := http.Client{Timeout: fetchTimeout}
-	
+
 	resp, err := client.Get(urlCentral)
 	if err == nil && resp.StatusCode == 200 {
 		defer resp.Body.Close()
@@ -481,7 +480,7 @@ func concurrentFetchPOM(group, artifact, version string) (*MavenPOM, string, err
 }
 
 // ----------------------------------------------------------------------
-// 8) MAVEN BFS FOR MAVEN/TOML/GRADLE
+// 9) MAVEN/TOML/GRADLE BFS (buildTransitiveClosureJavaLike)
 // ----------------------------------------------------------------------
 
 type queueItem struct {
@@ -636,8 +635,12 @@ func countCopyleftInTree(node *DependencyNode, sec *ReportSection) {
 }
 
 // ----------------------------------------------------------------------
-// 9) NODE & PYTHON BFS PARSING (FULL TRANSITIVE EXPANSION)
+// 10) NODE & PYTHON BFS PARSING (FULL TRANSITIVE EXPANSION)
 // ----------------------------------------------------------------------
+
+type requirement struct {
+	name, version string
+}
 
 func parseNodeDependencies(nodeFile string) ([]*DependencyNode, error) {
 	data, err := os.ReadFile(nodeFile)
@@ -935,77 +938,81 @@ var finalHTML = `
 </head>
 <body>
 <h1>Combined Dependency Report</h1>
-{{range .Sections}}
-  <h2>{{.FilePath}}</h2>
-  <p>
-    Direct Dependencies: {{.DirectCount}}<br/>
-    Transitive (incl. direct): {{.TransitiveCount}}<br/>
-    Indirect: {{.IndirectCount}}<br/>
-    Copyleft: {{.CopyleftCount}}<br/>
-    Unknown: {{.UnknownCount}}
-  </p>
-  <!-- Table First -->
-  <h3>Dependency Table</h3>
-  <table>
-    <tr>
-      <th>Dependency</th>
-      <th>Version</th>
-      <th>Parent</th>
-      <th>Top-Level</th>
-      <th>License</th>
-      <th>Details</th>
-    </tr>
-    {{range .Flattened}}
-    <tr {{if .Copyleft}}class="copyleft"{{else if eq .License "Unknown"}}class="unknown"{{end}}>
-      <td>{{.Dependency}}</td>
-      <td>{{.Version}}</td>
-      <td>{{.Parent}}</td>
-      <td>{{.TopLevel}}</td>
-      <td>{{.License}}</td>
-      <td>{{if .Details}}<a href="{{.Details}}" target="_blank">Link</a>{{end}}</td>
-    </tr>
-    {{end}}
-  </table>
-  <!-- Collapsible BFS Tree -->
-  <h3>Dependency Tree</h3>
-  <ul class="tree">
-    {{range $i, $root := .DependencyTree}}
-    <li class="tree-item">
-      <span class="toggle-btn" onclick="toggleSubtree('node-{{$.FilePath}}-{{$i}}')">[+/-]</span>
-      <strong>{{$root.Name}}@{{$root.Version}}</strong>
-      {{if eq $root.Parent "direct"}}(direct){{else}}(introduced by {{$root.Parent}}){{end}}
-      <br/>
-      License: <span {{if $root.Copyleft}}class="copyleft"{{else if eq $root.License "Unknown"}}class="unknown"{{end}}>{{$root.License}}</span>
-      {{if $root.UsedPOMURL}} [<a href="{{$root.UsedPOMURL}}" target="_blank">Link</a>]{{end}}
-      {{if $root.Transitive}}
-      <ul class="hidden" id="node-{{$.FilePath}}-{{$i}}">
-        {{template "subTree" $root.Transitive $.FilePath (print $i)}}
-      </ul>
-      {{end}}
-    </li>
-    {{end}}
-  </ul>
-  <hr/>
-{{end}}
 
-{{define "subTree"}}
-  {{- $file := index . 1 -}}
-  {{- $prefix := index . 2 -}}
-  {{- $nodes := index . 0 -}}
-  {{range $j, $child := $nodes}}
+{{range .Sections}}
+<h2>{{.FilePath}}</h2>
+<p>
+  Direct Dependencies: {{.DirectCount}}<br/>
+  Transitive (incl. direct): {{.TransitiveCount}}<br/>
+  Indirect: {{.IndirectCount}}<br/>
+  Copyleft: {{.CopyleftCount}}<br/>
+  Unknown: {{.UnknownCount}}
+</p>
+
+<!-- 1) TABLE FIRST -->
+<h3>Dependency Table</h3>
+<table>
+  <tr>
+    <th>Dependency</th>
+    <th>Version</th>
+    <th>Parent</th>
+    <th>Top-Level</th>
+    <th>License</th>
+    <th>Details</th>
+  </tr>
+  {{range .Flattened}}
+  <tr {{if .Copyleft}}class="copyleft"{{else if eq .License "Unknown"}}class="unknown"{{end}}>
+    <td>{{.Dependency}}</td>
+    <td>{{.Version}}</td>
+    <td>{{.Parent}}</td>
+    <td>{{.TopLevel}}</td>
+    <td>{{.License}}</td>
+    <td>{{if .Details}}<a href="{{.Details}}" target="_blank">Link</a>{{end}}</td>
+  </tr>
+  {{end}}
+</table>
+
+<!-- 2) COLLAPSIBLE BFS TREE -->
+<h3>Dependency Tree</h3>
+<ul class="tree">
+  {{range $i, $root := .DependencyTree}}
   <li class="tree-item">
-    <span class="toggle-btn" onclick="toggleSubtree('sub-{{$file}}-{{$prefix}}-{{$j}}')">[+/-]</span>
-    <strong>{{$child.Name}}@{{$child.Version}}</strong><br/>
-    License: <span {{if $child.Copyleft}}class="copyleft"{{else if eq $child.License "Unknown"}}class="unknown"{{end}}>{{$child.License}}</span>
-    {{if $child.UsedPOMURL}} [<a href="{{$child.UsedPOMURL}}" target="_blank">Link</a>]{{end}}
-    {{if $child.Transitive}}
-    <ul class="hidden" id="sub-{{$file}}-{{$prefix}}-{{$j}}">
-      {{template "subTree" $child.Transitive $file (print $prefix "-" $j)}}
+    <span class="toggle-btn" onclick="toggleSubtree('node-{{$.FilePath}}-{{$i}}')">[+/-]</span>
+    <strong>{{$root.Name}}@{{$root.Version}}</strong>
+    {{if eq $root.Parent "direct"}}(direct){{else}}(introduced by {{$root.Parent}}){{end}}
+    <br/>
+    License: <span {{if $root.Copyleft}}class="copyleft"{{else if eq $root.License "Unknown"}}class="unknown"{{end}}>{{$root.License}}</span>
+    {{if $root.UsedPOMURL}} [<a href="{{$root.UsedPOMURL}}" target="_blank">Link</a>]{{end}}
+    {{if $root.Transitive}}
+    <ul class="hidden" id="node-{{$.FilePath}}-{{$i}}">
+      {{template "subTree" $root.Transitive $.FilePath (print $i)}}
     </ul>
     {{end}}
   </li>
   {{end}}
+</ul>
+<hr/>
 {{end}}
+
+{{define "subTree"}}
+{{- $file := index . 1 -}}
+{{- $prefix := index . 2 -}}
+{{- $nodes := index . 0 -}}
+{{range $j, $child := $nodes}}
+<li class="tree-item">
+  <span class="toggle-btn" onclick="toggleSubtree('sub-{{$file}}-{{$prefix}}-{{$j}}')">[+/-]</span>
+  <strong>{{$child.Name}}@{{$child.Version}}</strong><br/>
+  License: <span {{if $child.Copyleft}}class="copyleft"{{else if eq $child.License "Unknown"}}class="unknown"{{end}}>{{$child.License}}</span>
+  {{if $child.UsedPOMURL}} [<a href="{{$child.UsedPOMURL}}" target="_blank">Link</a>]{{end}}
+  {{if $child.Transitive}}
+  <ul class="hidden" id="sub-{{$file}}-{{$prefix}}-{{$j}}">
+    {{template "subTree" $child.Transitive $file (print $prefix "-" $j)}}
+  </ul>
+  {{end}}
+</li>
+{{end}}
+{{end}}
+
 </body>
 </html>
 `
@@ -1082,7 +1089,7 @@ func main() {
 		sections = append(sections, rs)
 	}
 
-	// BFS for Maven/TOML/Gradle
+	// Build BFS for Maven/TOML/Gradle
 	buildTransitiveClosureJavaLike(sections)
 
 	// Node Dependencies
@@ -1136,7 +1143,7 @@ func main() {
 	close(pomRequests)
 	wgWorkers.Wait()
 
-	// Flatten each BFS tree into table rows.
+	// Flatten BFS trees to table rows.
 	for i := range sections {
 		flattenBFS(&sections[i])
 	}
@@ -1165,7 +1172,9 @@ func main() {
 }
 
 // ----------------------------------------------------------------------
-// Utility: Count total BFS nodes.
+// 13) UTILITY: COUNT TOTAL DEPENDENCIES
+// ----------------------------------------------------------------------
+
 func countTotalDependencies(nodes []*DependencyNode) int {
 	count := 0
 	var rec func([]*DependencyNode)
