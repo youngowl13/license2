@@ -39,10 +39,10 @@ var (
 )
 
 // ----------------------------------------------------------------------
-// Type Definitions
+// Type Definitions (Common for BFS)
 // ----------------------------------------------------------------------
 
-// For BFS (used in all file types)
+// BFS node used for all file types
 type DependencyNode struct {
 	Name       string
 	Version    string
@@ -50,11 +50,11 @@ type DependencyNode struct {
 	Copyleft   bool
 	Parent     string // "direct" or parent's coordinate (e.g. "group/artifact@version")
 	Transitive []*DependencyNode
-	UsedPOMURL string // For Maven, this is the POM URL; for Node/Python, the details link
+	UsedPOMURL string // For Maven, the POM URL; for Node/Python, the Details link
 	Direct     string // Top-level dependency name that introduced this node
 }
 
-// Extended dependency info (flattened)
+// ExtendedDep holds flattened info (if needed)
 type ExtendedDep struct {
 	Display      string
 	Lookup       string
@@ -64,7 +64,7 @@ type ExtendedDep struct {
 	PomURL       string
 }
 
-// ReportSection holds the BFS tree and flattened table rows for a given file.
+// Each file becomes one ReportSection
 type ReportSection struct {
 	FilePath        string
 	DirectDeps      map[string]string // e.g. "com.google.guava/guava" => "31.1-jre"
@@ -75,10 +75,10 @@ type ReportSection struct {
 	IndirectCount   int
 	CopyleftCount   int
 	UnknownCount    int
-	Flattened       []FlattenedDep // Flattened BFS for table view
+	Flattened       []FlattenedDep // Flattened table rows
 }
 
-// FlattenedDep holds a single row for the final table.
+// Flattened table row
 type FlattenedDep struct {
 	Dependency string
 	Version    string
@@ -86,15 +86,15 @@ type FlattenedDep struct {
 	TopLevel   string
 	License    string
 	Copyleft   bool
-	Details    string // For Node/Python or Maven POM link
+	Details    string // Link for details (Maven POM or Node/Python)
 }
 
-// ----------------------
-// Maven License Checker Types & Parsing
-// ----------------------
+// ----------------------------------------------------------------------
+// Maven/TOML/Gradle Parsing Types & Functions
+// ----------------------------------------------------------------------
 
 // Maven XML structures
-type License struct {
+type LicenseXML struct {
 	Name string `xml:"name"`
 	URL  string `xml:"url"`
 }
@@ -108,9 +108,9 @@ type POMDep struct {
 }
 
 type MavenPOM struct {
-	XMLName        xml.Name  `xml:"project"`
-	Licenses       []License `xml:"licenses>license"`
-	Dependencies   []POMDep  `xml:"dependencies>dependency"`
+	XMLName        xml.Name   `xml:"project"`
+	Licenses       []LicenseXML `xml:"licenses>license"`
+	Dependencies   []POMDep   `xml:"dependencies>dependency"`
 	DependencyMgmt struct {
 		Dependencies []POMDep `xml:"dependencies>dependency"`
 	} `xml:"dependencyManagement"`
@@ -121,7 +121,6 @@ type MavenPOM struct {
 	} `xml:"parent"`
 }
 
-// Find all pom.xml files
 func findAllPOMFiles(root string) ([]string, error) {
 	var files []string
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
@@ -136,7 +135,6 @@ func findAllPOMFiles(root string) ([]string, error) {
 	return files, err
 }
 
-// Parse a single pom.xml to extract direct dependencies
 func parseOneLocalPOMFile(filePath string) (map[string]string, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -161,10 +159,7 @@ func parseOneLocalPOMFile(filePath string) (map[string]string, error) {
 	return deps, nil
 }
 
-// ----------------------
 // TOML Parsing
-// ----------------------
-
 func findAllTOMLFiles(root string) ([]string, error) {
 	var files []string
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
@@ -244,10 +239,7 @@ func loadVersions(tree *toml.Tree) (map[string]string, error) {
 	return versions, nil
 }
 
-// ----------------------
 // Gradle Parsing
-// ----------------------
-
 func findAllGradleFiles(root string) ([]string, error) {
 	var files []string
 	err := filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
@@ -271,7 +263,6 @@ func parseBuildGradleFile(filePath string) (map[string]string, error) {
 	content := string(data)
 	varMap := parseGradleVariables(content)
 	deps := make(map[string]string)
-
 	re := regexp.MustCompile(`(?m)^\s*(implementation|api|compileOnly|runtimeOnly|testImplementation|androidTestImplementation|classpath)\s+['"]([^'"]+)['"]`)
 	matches := re.FindAllStringSubmatch(content, -1)
 	for _, m := range matches {
@@ -329,279 +320,22 @@ func parseVersionRange(v string) string {
 	return v
 }
 
-// ----------------------
-// Node & Python Parsing
-// ----------------------
-
-// Node Dependency (BFS will use the same DependencyNode type)
-type NodeDependency struct {
-	Name       string
-	Version    string
-	License    string
-	Details    string
-	Copyleft   bool
-	Transitive []*NodeDependency
-	Language   string
-}
-
-func findFile(root, target string) string {
-	var found string
-	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
-		if err == nil && d.Name() == target {
-			found = path
-			return fs.SkipDir
-		}
-		return nil
-	})
-	return found
-}
-
-func removeCaretTilde(ver string) string {
-	ver = strings.TrimSpace(ver)
-	return strings.TrimLeft(ver, "^~")
-}
-
-func parseNodeDependencies(nodeFile string) ([]*NodeDependency, error) {
-	data, err := os.ReadFile(nodeFile)
-	if err != nil {
-		return nil, err
-	}
-	var pkg map[string]interface{}
-	if e := json.Unmarshal(data, &pkg); e != nil {
-		return nil, e
-	}
-	deps, _ := pkg["dependencies"].(map[string]interface{})
-	if deps == nil {
-		return nil, fmt.Errorf("no dependencies found in package.json")
-	}
-	visited := make(map[string]bool)
-	var results []*NodeDependency
-	for nm, ver := range deps {
-		vstr, _ := ver.(string)
-		nd, e := resolveNodeDependency(nm, removeCaretTilde(vstr), visited)
-		if e == nil && nd != nil {
-			results = append(results, nd)
-		}
-	}
-	return results, nil
-}
-
-func resolveNodeDependency(pkgName, version string, visited map[string]bool) (*NodeDependency, error) {
-	key := pkgName + "@" + version
-	if visited[key] {
-		return nil, nil
-	}
-	visited[key] = true
-
-	url := "https://registry.npmjs.org/" + pkgName
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	var data map[string]interface{}
-	if e := json.NewDecoder(resp.Body).Decode(&data); e != nil {
-		return nil, e
-	}
-	if version == "" {
-		if dist, ok := data["dist-tags"].(map[string]interface{}); ok {
-			if lat, ok := dist["latest"].(string); ok {
-				version = lat
-			}
-		}
-	}
-	vs, _ := data["versions"].(map[string]interface{})
-	if vs == nil {
-		return nil, nil
-	}
-	verData, ok := vs[version].(map[string]interface{})
-	if !ok {
-		if dist, ok2 := data["dist-tags"].(map[string]interface{}); ok2 {
-			if lat, ok2 := dist["latest"].(string); ok2 {
-				if vMap, ok3 := vs[lat].(map[string]interface{}); ok3 {
-					log.Printf("Node fallback: no exact version %s for %s, using 'latest' => %s", version, pkgName, lat)
-					version = lat
-					verData = vMap
-					ok = true
-				}
-			}
-		}
-	}
-	license := "Unknown"
-	var trans []*NodeDependency
-	if ok && verData != nil {
-		license = findNpmLicense(verData)
-		if deps, ok2 := verData["dependencies"].(map[string]interface{}); ok2 {
-			for subName, subVer := range deps {
-				sv, _ := subVer.(string)
-				ch, e2 := resolveNodeDependency(subName, removeCaretTilde(sv), visited)
-				if e2 == nil && ch != nil {
-					trans = append(trans, ch)
-				}
-			}
-		}
-	}
-	nd := &NodeDependency{
-		Name:       pkgName,
-		Version:    version,
-		License:    license,
-		Details:    "https://www.npmjs.com/package/" + pkgName,
-		Copyleft:   isCopyleftChecker(license),
-		Transitive: trans,
-		Language:   "node",
-	}
-	return nd, nil
-}
-
-func findNpmLicense(verData map[string]interface{}) string {
-	if l, ok := verData["license"].(string); ok && l != "" {
-		return l
-	}
-	if lm, ok := verData["license"].(map[string]interface{}); ok {
-		if t, ok := lm["type"].(string); ok && t != "" {
-			return t
-		}
-		if nm, ok := lm["name"].(string); ok && nm != "" {
-			return nm
-		}
-	}
-	if arr, ok := verData["licenses"].([]interface{}); ok && len(arr) > 0 {
-		if obj, ok := arr[0].(map[string]interface{}); ok {
-			if t, ok := obj["type"].(string); ok && t != "" {
-				return t
-			}
-			if nm, ok := obj["name"].(string); ok && nm != "" {
-				return nm
-			}
-		}
-	}
-	return "Unknown"
-}
-
-// Python
-func parsePythonDependencies(reqFile string) ([]*PythonDependency, error) {
-	data, err := os.ReadFile(reqFile)
-	if err != nil {
-		return nil, err
-	}
-	lines := strings.Split(string(data), "\n")
-	var reqs []requirement
-	for _, line := range lines {
-		sline := strings.TrimSpace(line)
-		if sline == "" || strings.HasPrefix(sline, "#") {
-			continue
-		}
-		p := strings.Split(sline, "==")
-		if len(p) != 2 {
-			p = strings.Split(sline, ">=")
-			if len(p) != 2 {
-				log.Println("Invalid python requirement line:", sline)
-				continue
-			}
-		}
-		reqs = append(reqs, requirement{strings.TrimSpace(p[0]), strings.TrimSpace(p[1])})
-	}
-	visited := make(map[string]bool)
-	var results []*PythonDependency
-	for _, r := range reqs {
-		d, e := resolvePythonDependency(r.name, r.version, visited)
-		if e == nil && d != nil {
-			results = append(results, d)
-		} else if e != nil {
-			log.Println("Python parse error for", r.name, ":", e)
-		}
-	}
-	return results, nil
-}
-
-type requirement struct {
-	name, version string
-}
-
-func parsePyRequiresDistLine(line string) (string, string) {
-	parts := strings.FieldsFunc(line, func(r rune) bool {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
-			return false
-		}
-		return true
-	})
-	if len(parts) > 0 {
-		return strings.TrimSpace(parts[0]), ""
-	}
-	return "", ""
-}
-
-func resolvePythonDependency(pkgName, version string, visited map[string]bool) (*PythonDependency, error) {
-	key := strings.ToLower(pkgName) + "@" + version
-	if visited[key] {
-		return nil, nil
-	}
-	visited[key] = true
-
-	url := "https://pypi.org/pypi/" + pkgName + "/json"
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("PyPI returned status %d for %s", resp.StatusCode, pkgName)
-	}
-	var data map[string]interface{}
-	if e := json.NewDecoder(resp.Body).Decode(&data); e != nil {
-		return nil, e
-	}
-	info, _ := data["info"].(map[string]interface{})
-	if info == nil {
-		return nil, fmt.Errorf("info missing for %s", pkgName)
-	}
-	if version == "" {
-		if v, ok := info["version"].(string); ok {
-			version = v
-		}
-	}
-	releases, _ := data["releases"].(map[string]interface{})
-	if releases != nil {
-		if _, ok := releases[version]; !ok {
-			if v, ok2 := info["version"].(string); ok2 && v != "" {
-				version = v
-			}
-		}
-	}
-	license := "Unknown"
-	if l, ok := info["license"].(string); ok && l != "" {
-		license = l
-	}
-	var trans []*PythonDependency
-	if arr, ok := info["requires_dist"].([]interface{}); ok && len(arr) > 0 {
-		for _, x := range arr {
-			line, _ := x.(string)
-			subName, _ := parsePyRequiresDistLine(line)
-			if subName == "" {
-				continue
-			}
-			ch, e := resolvePythonDependency(subName, "", visited)
-			if e == nil && ch != nil {
-				trans = append(trans, ch)
-			}
-		}
-	}
-	py := &PythonDependency{
-		Name:       pkgName,
-		Version:    version,
-		License:    license,
-		Details:    "https://pypi.org/project/" + pkgName,
-		Copyleft:   isCopyleftChecker(license),
-		Transitive: trans,
-		Language:   "python",
-	}
-	return py, nil
-}
-
 // ----------------------------------------------------------------------
-// Helper Functions: detectLicense & isCopyleftChecker
+// Helper Functions: skipScope, splitGA, detectLicense, isCopyleftChecker
 // ----------------------------------------------------------------------
+
+func skipScope(scope, optional string) bool {
+	s := strings.ToLower(strings.TrimSpace(scope))
+	return s == "test" || s == "provided" || s == "system" || strings.EqualFold(strings.TrimSpace(optional), "true")
+}
+
+func splitGA(ga string) (string, string) {
+	parts := strings.Split(ga, "/")
+	if len(parts) != 2 {
+		return "", ""
+	}
+	return parts[0], parts[1]
+}
 
 func detectLicense(pom *MavenPOM) string {
 	if len(pom.Licenses) > 0 {
@@ -627,7 +361,7 @@ func isCopyleftChecker(license string) bool {
 }
 
 // ----------------------------------------------------------------------
-// Maven BFS for Maven/TOML/Gradle
+// Maven BFS Functions
 // ----------------------------------------------------------------------
 
 type queueItem struct {
@@ -638,6 +372,88 @@ type queueItem struct {
 	Direct        string
 }
 
+type introducerSet map[string]bool
+
+func fetchRemotePOM(group, artifact, version string) (*MavenPOM, string, error) {
+	groupPath := strings.ReplaceAll(group, ".", "/")
+	urlCentral := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, artifact, version, artifact, version)
+	urlGoogle := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, artifact, version, artifact, version)
+	client := http.Client{Timeout: fetchTimeout}
+
+	log.Printf("[FETCH-REMOTE] Trying Maven Central => %s", urlCentral)
+	resp, err := client.Get(urlCentral)
+	if err == nil && resp.StatusCode == 200 {
+		defer resp.Body.Close()
+		data, err := io.ReadAll(resp.Body)
+		if err != nil {
+			return nil, "", err
+		}
+		var pom MavenPOM
+		if err := xml.Unmarshal(data, &pom); err != nil {
+			return nil, "", err
+		}
+		return &pom, urlCentral, nil
+	}
+	if resp != nil {
+		resp.Body.Close()
+	}
+	log.Printf("[FETCH-REMOTE] Trying Google Maven => %s", urlGoogle)
+	resp2, err2 := client.Get(urlGoogle)
+	if err2 == nil && resp2.StatusCode == 200 {
+		defer resp2.Body.Close()
+		data, err := io.ReadAll(resp2.Body)
+		if err != nil {
+			return nil, "", err
+		}
+		var pom MavenPOM
+		if err := xml.Unmarshal(data, &pom); err != nil {
+			return nil, "", err
+		}
+		return &pom, urlGoogle, nil
+	}
+	if resp2 != nil {
+		resp2.Body.Close()
+	}
+	return nil, "", fmt.Errorf("could not fetch POM for %s:%s:%s", group, artifact, version)
+}
+
+func concurrentFetchPOM(group, artifact, version string) (*MavenPOM, string, error) {
+	key := fmt.Sprintf("%s:%s:%s", group, artifact, version)
+	if cached, ok := pomCache.Load(key); ok {
+		return cached.(*MavenPOM), "", nil
+	}
+	channelMutex.Lock()
+	open := channelOpen
+	channelMutex.Unlock()
+	if !open {
+		pom, urlUsed, err := fetchRemotePOM(group, artifact, version)
+		if err == nil && pom != nil {
+			pomCache.Store(key, pom)
+		}
+		return pom, urlUsed, err
+	}
+	req := fetchRequest{
+		GroupID:    group,
+		ArtifactID: artifact,
+		Version:    version,
+		ResultChan: make(chan fetchResult, 1),
+	}
+	pomRequests <- req
+	res := <-req.ResultChan
+	if res.Err == nil && res.POM != nil {
+		pomCache.Store(key, res.POM)
+	}
+	return res.POM, res.UsedURL, res.Err
+}
+
+func pomFetchWorker() {
+	defer wgWorkers.Done()
+	for req := range pomRequests {
+		pom, usedURL, err := fetchRemotePOM(req.GroupID, req.ArtifactID, req.Version)
+		req.ResultChan <- fetchResult{POM: pom, UsedURL: usedURL, Err: err}
+	}
+}
+
 func buildTransitiveClosureJavaLike(sections []ReportSection) {
 	for i := range sections {
 		sec := &sections[i]
@@ -646,17 +462,14 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 			key := ga + "@" + ver
 			allDeps[key] = ExtendedDep{Display: ver, Lookup: ver, Parent: "direct"}
 		}
-
 		visited := make(map[string]introducerSet)
 		var queue []queueItem
 		var rootNodes []*DependencyNode
-
 		for ga, ver := range sec.DirectDeps {
 			key := ga + "@" + ver
 			ds := make(introducerSet)
 			ds[ga] = true
 			visited[key] = ds
-
 			node := &DependencyNode{
 				Name:    ga,
 				Version: ver,
@@ -672,7 +485,6 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 				Direct:        ga,
 			})
 		}
-
 		for len(queue) > 0 {
 			it := queue[0]
 			queue = queue[1:]
@@ -717,7 +529,6 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 				ds := make(introducerSet)
 				ds[it.Direct] = true
 				visited[childKey] = ds
-
 				childNode := &DependencyNode{
 					Name:    childGA,
 					Version: cv,
@@ -734,7 +545,6 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 				})
 			}
 		}
-
 		for _, root := range rootNodes {
 			setIntroducedBy(root, root.Name, allDeps)
 		}
@@ -742,7 +552,6 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 			sec.AllDeps[k] = v
 		}
 		sec.DependencyTree = rootNodes
-
 		sec.DirectCount = len(sec.DirectDeps)
 		for key := range sec.AllDeps {
 			if strings.Contains(key, "@") {
@@ -763,8 +572,6 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 		}
 	}
 }
-
-type introducerSet map[string]bool
 
 func setIntroducedBy(node *DependencyNode, rootName string, all map[string]ExtendedDep) {
 	for _, child := range node.Transitive {
@@ -790,52 +597,21 @@ func countCopyleftInTree(node *DependencyNode, sec *ReportSection) {
 }
 
 // ----------------------------------------------------------------------
-// 10) Conversion Functions for Node & Python
+// Conversion Functions for Node Dependencies
 // ----------------------------------------------------------------------
 
-// Convert Node dependencies (already in NodeDependency form) into ReportSection
-func convertNodeDepsToReportSection(filePath string, nodeDeps []*NodeDependency) ReportSection {
-	directDeps := make(map[string]string)
-	allDeps := make(map[string]ExtendedDep)
-	var rootNodes []*DependencyNode
-
-	for _, nd := range nodeDeps {
-		key := nd.Name + "@" + nd.Version
-		directDeps[nd.Name] = nd.Version
-		allDeps[key] = ExtendedDep{Display: nd.Version, Lookup: nd.Version, Parent: "direct"}
-		root := convertOneNodeDep(nd, "", "")
-		rootNodes = append(rootNodes, root)
-	}
-	for _, root := range rootNodes {
-		setIntroducedByNode(root, root.Name, allDeps)
-	}
-	sec := ReportSection{
-		FilePath:   filePath,
-		DirectDeps: directDeps,
-		AllDeps:    allDeps,
-	}
-	sec.DependencyTree = rootNodes
-	sec.DirectCount = len(directDeps)
-	for k := range allDeps {
-		if strings.Contains(k, "@") {
-			parts := strings.Split(k, "@")
-			if len(parts) == 2 {
-				if parts[1] == "unknown" {
-					sec.UnknownCount++
-				} else {
-					sec.TransitiveCount++
-				}
-			}
-		}
-	}
-	sec.IndirectCount = sec.TransitiveCount - sec.DirectCount
-	for _, root := range rootNodes {
-		countCopyleftInTree(root, &sec)
-	}
-	return sec
+// Define a separate type for Node dependencies for parsing
+type NodeDep struct {
+	Name       string
+	Version    string
+	License    string
+	Details    string
+	Copyleft   bool
+	Transitive []*NodeDep
+	Language   string
 }
 
-func convertOneNodeDep(nd *NodeDependency, parentGA, directName string) *DependencyNode {
+func convertOneNodeDep(nd *NodeDep, parentGA, directName string) *DependencyNode {
 	myParent := "direct"
 	myDirect := nd.Name
 	if parentGA != "" {
@@ -872,11 +648,101 @@ func setIntroducedByNode(node *DependencyNode, rootName string, all map[string]E
 	}
 }
 
-func convertPythonDepsToReportSection(filePath string, pyDeps []*PythonDependency) ReportSection {
+func convertNodeDepsToReportSection(filePath string, nodeDeps []*NodeDep) ReportSection {
 	directDeps := make(map[string]string)
 	allDeps := make(map[string]ExtendedDep)
 	var rootNodes []*DependencyNode
+	for _, nd := range nodeDeps {
+		key := nd.Name + "@" + nd.Version
+		directDeps[nd.Name] = nd.Version
+		allDeps[key] = ExtendedDep{Display: nd.Version, Lookup: nd.Version, Parent: "direct"}
+		root := convertOneNodeDep(nd, "", "")
+		rootNodes = append(rootNodes, root)
+	}
+	for _, root := range rootNodes {
+		setIntroducedByNode(root, root.Name, allDeps)
+	}
+	sec := ReportSection{
+		FilePath:   filePath,
+		DirectDeps: directDeps,
+		AllDeps:    allDeps,
+	}
+	sec.DependencyTree = rootNodes
+	sec.DirectCount = len(directDeps)
+	for k := range allDeps {
+		if strings.Contains(k, "@") {
+			parts := strings.Split(k, "@")
+			if len(parts) == 2 {
+				if parts[1] == "unknown" {
+					sec.UnknownCount++
+				} else {
+					sec.TransitiveCount++
+				}
+			}
+		}
+	}
+	sec.IndirectCount = sec.TransitiveCount - sec.DirectCount
+	for _, root := range rootNodes {
+		countCopyleftInTree(root, &sec)
+	}
+	return sec
+}
 
+// ----------------------------------------------------------------------
+// Conversion Functions for Python Dependencies
+// ----------------------------------------------------------------------
+
+type PythonDep struct {
+	Name       string
+	Version    string
+	License    string
+	Details    string
+	Copyleft   bool
+	Transitive []*PythonDep
+	Language   string
+}
+
+func convertOnePyDep(pd *PythonDep, parentGA, directName string) *DependencyNode {
+	myParent := "direct"
+	myDirect := pd.Name
+	if parentGA != "" {
+		myParent = parentGA
+		myDirect = directName
+	}
+	node := &DependencyNode{
+		Name:       pd.Name,
+		Version:    pd.Version,
+		License:    pd.License,
+		Copyleft:   pd.Copyleft,
+		Parent:     myParent,
+		Direct:     myDirect,
+		UsedPOMURL: pd.Details,
+	}
+	for _, child := range pd.Transitive {
+		cn := convertOnePyDep(child, pd.Name+"@"+pd.Version, pd.Name)
+		node.Transitive = append(node.Transitive, cn)
+	}
+	return node
+}
+
+func setIntroducedByPy(node *DependencyNode, rootName string, all map[string]ExtendedDep) {
+	key := node.Name + "@" + node.Version
+	inf := all[key]
+	if inf.IntroducedBy == "" {
+		inf.IntroducedBy = rootName
+	} else if !strings.Contains(inf.IntroducedBy, rootName) {
+		inf.IntroducedBy += ", " + rootName
+	}
+	all[key] = inf
+	for _, ch := range node.Transitive {
+		setIntroducedByPy(ch, rootName, all)
+	}
+}
+
+func convertPythonDepsToReportSection(filePath string, pyDeps []*PythonDep) ReportSection {
+	directDeps := make(map[string]string)
+	allDeps := make(map[string]ExtendedDep)
+	var rootNodes []*DependencyNode
 	for _, pd := range pyDeps {
 		key := pd.Name + "@" + pd.Version
 		directDeps[pd.Name] = pd.Version
@@ -913,45 +779,8 @@ func convertPythonDepsToReportSection(filePath string, pyDeps []*PythonDependenc
 	return sec
 }
 
-func convertOnePyDep(pd *PythonDependency, parentGA, directName string) *DependencyNode {
-	myParent := "direct"
-	myDirect := pd.Name
-	if parentGA != "" {
-		myParent = parentGA
-		myDirect = directName
-	}
-	node := &DependencyNode{
-		Name:       pd.Name,
-		Version:    pd.Version,
-		License:    pd.License,
-		Copyleft:   pd.Copyleft,
-		Parent:     myParent,
-		Direct:     myDirect,
-		UsedPOMURL: pd.Details,
-	}
-	for _, ch := range pd.Transitive {
-		child := convertOnePyDep(ch, pd.Name+"@"+pd.Version, pd.Name)
-		node.Transitive = append(node.Transitive, child)
-	}
-	return node
-}
-
-func setIntroducedByPy(node *DependencyNode, rootName string, all map[string]ExtendedDep) {
-	key := node.Name + "@" + node.Version
-	inf := all[key]
-	if inf.IntroducedBy == "" {
-		inf.IntroducedBy = rootName
-	} else if !strings.Contains(inf.IntroducedBy, rootName) {
-		inf.IntroducedBy += ", " + rootName
-	}
-	all[key] = inf
-	for _, ch := range node.Transitive {
-		setIntroducedByPy(ch, rootName, all)
-	}
-}
-
 // ----------------------------------------------------------------------
-// 11) Flatten BFS Tree into Table Rows
+// 15) Flatten BFS Tree into Table Rows
 // ----------------------------------------------------------------------
 
 func flattenBFS(sec *ReportSection) {
@@ -980,7 +809,7 @@ func flattenOneTree(node *DependencyNode, rows []FlattenedDep) []FlattenedDep {
 }
 
 // ----------------------------------------------------------------------
-// 12) Final HTML Template (BFS Bullet-List + Table for Each File)
+// 16) Final HTML Template (BFS Bullet-List + Table per File)
 // ----------------------------------------------------------------------
 
 var finalHTML = `
@@ -1011,7 +840,7 @@ var finalHTML = `
   Transitive (incl. direct): {{.TransitiveCount}}<br/>
   Indirect: {{.IndirectCount}}<br/>
   Copyleft: {{.CopyleftCount}}<br/>
-  Unknown Version: {{.UnknownCount}}
+  Unknown: {{.UnknownCount}}
 </p>
 <h3>BFS Tree</h3>
 <ul>
@@ -1047,7 +876,6 @@ var finalHTML = `
 </table>
 <hr/>
 {{end}}
-
 {{define "bfsList"}}
 <ul>
   {{range .}}
@@ -1065,7 +893,7 @@ var finalHTML = `
 `
 
 // ----------------------------------------------------------------------
-// 13) Main Function
+// 17) Main Function
 // ----------------------------------------------------------------------
 
 func main() {
@@ -1077,10 +905,9 @@ func main() {
 
 	rootDir := "."
 
-	// Gather ReportSections for Maven, TOML, Gradle
 	var sections []ReportSection
 
-	// Maven
+	// Maven Files
 	pomFiles, _ := findAllPOMFiles(rootDir)
 	for _, pf := range pomFiles {
 		deps, err := parseOneLocalPOMFile(pf)
@@ -1096,7 +923,7 @@ func main() {
 		sections = append(sections, rs)
 	}
 
-	// TOML
+	// TOML Files
 	tomlFiles, _ := findAllTOMLFiles(rootDir)
 	for _, tf := range tomlFiles {
 		deps, err := parseTOMLFile(tf)
@@ -1112,7 +939,7 @@ func main() {
 		sections = append(sections, rs)
 	}
 
-	// Gradle
+	// Gradle Files
 	gradleFiles, _ := findAllGradleFiles(rootDir)
 	for _, gf := range gradleFiles {
 		deps, err := parseBuildGradleFile(gf)
@@ -1128,10 +955,10 @@ func main() {
 		sections = append(sections, rs)
 	}
 
-	// Perform BFS expansions for Maven/TOML/Gradle
+	// BFS for Maven/TOML/Gradle
 	buildTransitiveClosureJavaLike(sections)
 
-	// Gather Node dependencies
+	// Node Dependencies
 	nodeFile := findFile(rootDir, "package.json")
 	if nodeFile != "" {
 		nodeDeps, err := parseNodeDependencies(nodeFile)
@@ -1143,7 +970,7 @@ func main() {
 		}
 	}
 
-	// Gather Python dependencies
+	// Python Dependencies
 	pyFile := findFile(rootDir, "requirements.txt")
 	if pyFile != "" {
 		pyDeps, err := parsePythonDependencies(pyFile)
@@ -1155,16 +982,14 @@ func main() {
 		}
 	}
 
-	// Close Maven BFS channel and wait
 	close(pomRequests)
 	wgWorkers.Wait()
 
-	// Flatten each BFS tree to table rows
+	// Flatten BFS trees to table rows for each section
 	for i := range sections {
 		flattenBFS(&sections[i])
 	}
 
-	// Render final HTML report
 	type finalData struct {
 		Sections []ReportSection
 	}
