@@ -30,16 +30,16 @@ const (
 )
 
 var (
-	// Maven caching & concurrency
+	// Maven concurrency + caching
 	pomRequests  = make(chan fetchRequest, 50)
 	wgWorkers    sync.WaitGroup
 	pomCache     sync.Map // key: "group:artifact:version" -> *MavenPOM
 	channelOpen  = true
 	channelMutex sync.Mutex
 
-	// Node and Python caching
-	nodeCache   sync.Map // key: "pkg@version" -> *DependencyNode
-	pythonCache sync.Map // key: "pkg@version" -> *DependencyNode
+	// Node & Python caching
+	nodeCache   sync.Map // key: "package@version" -> *DependencyNode
+	pythonCache sync.Map // key: "package@version" -> *DependencyNode
 )
 
 // ----------------------------------------------------------------------
@@ -53,7 +53,7 @@ type DependencyNode struct {
 	Copyleft   bool
 	Parent     string            // "direct" or parent's coordinate
 	Transitive []*DependencyNode // child dependencies
-	UsedPOMURL string            // For Maven: POM file link; for Node/Python: package page link
+	UsedPOMURL string            // BFS link => "POM File Link" for Maven or package page for Node/Python
 	Direct     string            // top-level dependency that introduced this node
 }
 
@@ -111,7 +111,7 @@ type fetchResult struct {
 }
 
 // ----------------------------------------------------------------------
-// 4) MAVEN XML STRUCTURES & PARSING
+// 4) MAVEN XML STRUCTURES
 // ----------------------------------------------------------------------
 
 type LicenseXML struct {
@@ -142,7 +142,7 @@ type MavenPOM struct {
 }
 
 // ----------------------------------------------------------------------
-// 5) FILE DISCOVERY FUNCTIONS
+// 5) FILE DISCOVERY
 // ----------------------------------------------------------------------
 
 func findAllPOMFiles(root string) ([]string, error) {
@@ -250,7 +250,7 @@ func parseVersionRange(v string) string {
 }
 
 // ----------------------------------------------------------------------
-// 7) PARSING FUNCTIONS: MAVEN, TOML, GRADLE
+// 7) PARSING: MAVEN, TOML, GRADLE
 // ----------------------------------------------------------------------
 
 func parseOneLocalPOMFile(filePath string) (map[string]string, error) {
@@ -396,7 +396,7 @@ func parseGradleVariables(content string) map[string]string {
 }
 
 // ----------------------------------------------------------------------
-// 8) MAVEN BFS WORKER & FETCH FUNCTIONS
+// 8) MAVEN BFS WORKER & FETCH
 // ----------------------------------------------------------------------
 
 func pomFetchWorker() {
@@ -509,6 +509,8 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 		visited := make(map[string]introducerSet)
 		var queue []queueItem
 		var rootNodes []*DependencyNode
+
+		// Initialize BFS with direct dependencies
 		for ga, ver := range sec.DirectDeps {
 			key := ga + "@" + ver
 			ds := make(introducerSet)
@@ -529,9 +531,12 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 				Direct:        ga,
 			})
 		}
+
+		// BFS loop
 		for len(queue) > 0 {
 			it := queue[0]
 			queue = queue[1:]
+
 			group, artifact := splitGA(it.GroupArtifact)
 			if group == "" || artifact == "" {
 				continue
@@ -589,10 +594,14 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 				})
 			}
 		}
+
+		// Mark introducedBy
 		for _, root := range rootNodes {
 			setIntroducedBy(root, root.Name, allDeps)
 		}
 		sec.DependencyTree = rootNodes
+
+		// Flatten extended info
 		for k, v := range allDeps {
 			sec.AllDeps[k] = v
 		}
@@ -614,11 +623,25 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 		for _, root := range rootNodes {
 			countCopyleftInTree(root, sec)
 		}
-		// Recursively sort the BFS tree nodes
-		for _, root := range sec.DependencyTree {
+
+		// Sort BFS root nodes by color
+		sort.Slice(rootNodes, func(i, j int) bool {
+			return colorRank(rootNodes[i]) < colorRank(rootNodes[j])
+		})
+		// Sort BFS children recursively
+		for _, root := range rootNodes {
 			sortDependencyNodes(root)
 		}
 	}
+}
+
+func colorRank(n *DependencyNode) int {
+	if n.Copyleft {
+		return 0
+	} else if strings.EqualFold(n.License, "unknown") {
+		return 1
+	}
+	return 2
 }
 
 func setIntroducedBy(node *DependencyNode, rootName string, all map[string]ExtendedDep) {
@@ -683,7 +706,6 @@ func resolveNodeDependency(pkgName, version string, visited map[string]bool) (*D
 		return nil, nil
 	}
 	visited[key] = true
-	// Check nodeCache
 	if val, ok := nodeCache.Load(key); ok {
 		return val.(*DependencyNode), nil
 	}
@@ -710,6 +732,7 @@ func resolveNodeDependency(pkgName, version string, visited map[string]bool) (*D
 	}
 	verData, ok := vs[version].(map[string]interface{})
 	if !ok {
+		// fallback
 		if dist, ok2 := data["dist-tags"].(map[string]interface{}); ok2 {
 			if lat, ok2 := dist["latest"].(string); ok2 {
 				if vMap, ok3 := vs[lat].(map[string]interface{}); ok3 {
@@ -809,7 +832,8 @@ func parsePythonDependencies(reqFile string) ([]*DependencyNode, error) {
 
 func parsePyRequiresDistLine(line string) (string, string) {
 	parts := strings.FieldsFunc(line, func(r rune) bool {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
 			return false
 		}
 		return true
@@ -826,7 +850,6 @@ func resolvePythonDependency(pkgName, version string, visited map[string]bool) (
 		return nil, nil
 	}
 	visited[key] = true
-	// Check pythonCache
 	if val, ok := pythonCache.Load(key); ok {
 		return val.(*DependencyNode), nil
 	}
@@ -892,22 +915,32 @@ func resolvePythonDependency(pkgName, version string, visited map[string]bool) (
 }
 
 // ----------------------------------------------------------------------
-// 11) FLATTEN BFS => TABLE ROWS (ordered: copyleft, unknown, known)
+// 11) FLATTEN BFS => TABLE ROWS
 // ----------------------------------------------------------------------
 
 func flattenBFS(sec *ReportSection) {
 	var copyleftRows, unknownRows, knownRows []FlattenedDep
+
+	// We'll do a DFS and place each node into one of the three slices
 	var walk func(node *DependencyNode)
 	walk = func(node *DependencyNode) {
-		var detail string
+		// Determine the text for "Project Details" column
 		lowerPath := strings.ToLower(sec.FilePath)
-		if strings.HasSuffix(lowerPath, "pom.xml") || strings.HasSuffix(lowerPath, "build.gradle") || strings.HasSuffix(lowerPath, ".toml") {
+		var detail string
+		if strings.HasSuffix(lowerPath, "pom.xml") ||
+			strings.HasSuffix(lowerPath, "build.gradle") ||
+			strings.HasSuffix(lowerPath, ".toml") {
+			// For Maven/TOML/Gradle => plain text
 			detail = fmt.Sprintf("Module: %s v%s", node.Name, node.Version)
-		} else if strings.Contains(lowerPath, "package.json") || strings.Contains(lowerPath, "requirements.txt") {
+		} else if strings.Contains(lowerPath, "package.json") ||
+			strings.Contains(lowerPath, "requirements.txt") {
+			// For Node/Python => link to registry
 			detail = node.UsedPOMURL
 		} else {
+			// fallback
 			detail = node.UsedPOMURL
 		}
+
 		row := FlattenedDep{
 			Dependency: node.Name,
 			Version:    node.Version,
@@ -917,21 +950,26 @@ func flattenBFS(sec *ReportSection) {
 			Copyleft:   node.Copyleft,
 			Details:    detail,
 		}
-		switch {
-		case node.Copyleft:
+
+		if node.Copyleft {
 			copyleftRows = append(copyleftRows, row)
-		case strings.EqualFold(node.License, "unknown"):
+		} else if strings.EqualFold(node.License, "unknown") {
 			unknownRows = append(unknownRows, row)
-		default:
+		} else {
 			knownRows = append(knownRows, row)
 		}
+
 		for _, child := range node.Transitive {
 			walk(child)
 		}
 	}
+
+	// Walk each BFS root
 	for _, root := range sec.DependencyTree {
 		walk(root)
 	}
+
+	// Combine: copyleft first, unknown second, known last
 	sec.Flattened = append(copyleftRows, append(unknownRows, knownRows...)...)
 }
 
@@ -978,6 +1016,7 @@ var finalHTML = `
 </head>
 <body>
 <h1>Combined Dependency Report</h1>
+
 {{range .Sections}}
   {{$fp := .FilePath}}
   <h2>{{$fp}}</h2>
@@ -988,6 +1027,7 @@ var finalHTML = `
     Copyleft: {{.CopyleftCount}}<br/>
     Unknown: {{.UnknownCount}}
   </p>
+
   <h3>Dependency Table</h3>
   <table>
     <tr>
@@ -1005,19 +1045,22 @@ var finalHTML = `
       <td>{{.Parent}}</td>
       <td>{{.TopLevel}}</td>
       <td>{{.License}}</td>
-      <td>{{if .Details}}{{.Details}}{{end}}</td>
+      <td>{{.Details}}</td>
     </tr>
     {{end}}
   </table>
+
   <h3>Dependency Tree</h3>
   <ul class="tree">
     {{range $i, $root := .DependencyTree}}
     <li class="{{if $root.Copyleft}}copyleft{{else if eq $root.License "Unknown"}}unknown{{else}}known{{end}}">
       <span class="toggle-btn" onclick="toggleSubtree('node-{{$fp}}-{{$i}}', this)">▶</span>
       <strong>{{$root.Name}}@{{$root.Version}}</strong>
-      {{if eq $root.Parent "direct"}}(direct){{else}}(introduced by {{$root.Parent}}){{end}}<br/>
+      {{if eq $root.Parent "direct"}}(direct){{else}}(introduced by {{$root.Parent}}){{end}}
+      <br/>
       License: {{$root.License}}<br/>
       POM File Link: {{if $root.UsedPOMURL}}<a href="{{$root.UsedPOMURL}}" target="_blank">Open</a>{{else}}(none){{end}}
+
       {{if $root.Transitive}}
       <ul class="hidden" id="node-{{$fp}}-{{$i}}">
         {{template "subTree" (dict "Nodes" $root.Transitive "File" $fp "Prefix" (print $i))}}
@@ -1028,15 +1071,18 @@ var finalHTML = `
   </ul>
   <hr/>
 {{end}}
+
 {{define "subTree"}}
   {{ $data := . }}
   {{range $j, $child := $data.Nodes}}
   <li class="{{if $child.Copyleft}}copyleft{{else if eq $child.License "Unknown"}}unknown{{else}}known{{end}}">
     <span class="toggle-btn" onclick="toggleSubtree('sub-{{$data.File}}-{{$data.Prefix}}-{{$j}}', this)">▶</span>
     <strong>{{$child.Name}}@{{$child.Version}}</strong>
-    {{if eq $child.Parent "direct"}}(direct){{else}}(introduced by {{$child.Parent}}){{end}}<br/>
+    {{if eq $child.Parent "direct"}}(direct){{else}}(introduced by {{$child.Parent}}){{end}}
+    <br/>
     License: {{$child.License}}<br/>
     POM File Link: {{if $child.UsedPOMURL}}<a href="{{$child.UsedPOMURL}}" target="_blank">Open</a>{{else}}(none){{end}}
+
     {{if $child.Transitive}}
     <ul class="hidden" id="sub-{{$data.File}}-{{$data.Prefix}}-{{$j}}">
       {{template "subTree" (dict "Nodes" $child.Transitive "File" $data.File "Prefix" (print $data.Prefix "-" $j))}}
@@ -1050,11 +1096,11 @@ var finalHTML = `
 `
 
 // ----------------------------------------------------------------------
-// 13) MAIN FUNCTION
+// 13) MAIN
 // ----------------------------------------------------------------------
 
 func main() {
-	// Start Maven BFS workers.
+	// Start Maven BFS workers
 	for i := 0; i < pomWorkerCount; i++ {
 		wgWorkers.Add(1)
 		go pomFetchWorker()
@@ -1064,7 +1110,7 @@ func main() {
 
 	var sections []ReportSection
 
-	// Maven Files
+	// 1) Maven
 	pomFiles, err := findAllPOMFiles(rootDir)
 	if err != nil {
 		log.Println("Error finding pom.xml files:", err)
@@ -1083,7 +1129,7 @@ func main() {
 		sections = append(sections, rs)
 	}
 
-	// TOML Files
+	// 2) TOML
 	tomlFiles, err := findAllTOMLFiles(rootDir)
 	if err != nil {
 		log.Println("Error finding .toml files:", err)
@@ -1102,7 +1148,7 @@ func main() {
 		sections = append(sections, rs)
 	}
 
-	// Gradle Files
+	// 3) Gradle
 	gradleFiles, err := findAllGradleFiles(rootDir)
 	if err != nil {
 		log.Println("Error finding Gradle files:", err)
@@ -1124,12 +1170,12 @@ func main() {
 	// BFS expansions for Maven/TOML/Gradle
 	buildTransitiveClosureJavaLike(sections)
 
-	// Node Dependencies
+	// 4) Node BFS
 	nodeFile := findFile(rootDir, "package.json")
 	if nodeFile != "" {
 		nodeDeps, err := parseNodeDependencies(nodeFile)
 		if err != nil {
-			log.Println("Error parsing Node dependencies:", err)
+			log.Println("Error parsing Node BFS:", err)
 		} else if len(nodeDeps) > 0 {
 			direct := make(map[string]string)
 			for _, n := range nodeDeps {
@@ -1148,12 +1194,12 @@ func main() {
 		}
 	}
 
-	// Python Dependencies
+	// 5) Python BFS
 	pyFile := findFile(rootDir, "requirements.txt")
 	if pyFile != "" {
 		pyDeps, err := parsePythonDependencies(pyFile)
 		if err != nil {
-			log.Println("Error parsing Python dependencies:", err)
+			log.Println("Error parsing Python BFS:", err)
 		} else if len(pyDeps) > 0 {
 			direct := make(map[string]string)
 			for _, p := range pyDeps {
@@ -1172,10 +1218,11 @@ func main() {
 		}
 	}
 
+	// Close BFS channel
 	close(pomRequests)
 	wgWorkers.Wait()
 
-	// Flatten each BFS tree into table rows.
+	// Flatten BFS => table
 	for i := range sections {
 		flattenBFS(&sections[i])
 	}
@@ -1244,20 +1291,13 @@ func dict(values ...interface{}) map[string]interface{} {
 }
 
 // ----------------------------------------------------------------------
-// 16) SORTING BFS TREE NODES BY COLOR (copyleft, unknown, known)
+// 16) SORTING BFS TREE NODES BY COLOR
 // ----------------------------------------------------------------------
 
 func sortDependencyNodes(node *DependencyNode) {
 	sort.Slice(node.Transitive, func(i, j int) bool {
-		rank := func(n *DependencyNode) int {
-			if n.Copyleft {
-				return 0
-			} else if strings.EqualFold(n.License, "unknown") {
-				return 1
-			}
-			return 2
-		}
-		ri, rj := rank(node.Transitive[i]), rank(node.Transitive[j])
+		ri := colorRank(node.Transitive[i])
+		rj := colorRank(node.Transitive[j])
 		if ri != rj {
 			return ri < rj
 		}
@@ -1266,4 +1306,13 @@ func sortDependencyNodes(node *DependencyNode) {
 	for _, child := range node.Transitive {
 		sortDependencyNodes(child)
 	}
+}
+
+func colorRank(n *DependencyNode) int {
+	if n.Copyleft {
+		return 0
+	} else if strings.EqualFold(n.License, "unknown") {
+		return 1
+	}
+	return 2
 }
