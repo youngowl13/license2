@@ -1,3 +1,4 @@
+// File: license_compliance_report.go
 package main
 
 import (
@@ -21,16 +22,17 @@ import (
 )
 
 // ----------------------------------------------------------------------
-// 1) CONFIG & GLOBALS (from license(1).go)
+// GLOBAL CONFIG AND SHARED STATE
 // ----------------------------------------------------------------------
 
 const (
-	localPOMCacheDir       = ".pom-cache"
-	pomWorkerCount         = 10
-	fetchTimeout           = 30 * time.Second
-	outputReportFinal      = "license_compliance_report.html"
+	localPOMCacheDir  = ".pom-cache"
+	pomWorkerCount    = 10
+	fetchTimeout      = 30 * time.Second
+	finalHTMLFilename = "license_compliance_report.html"
 )
 
+// For concurrency in Maven BFS:
 var (
 	pomRequests  = make(chan fetchRequest, 50)
 	wgWorkers    sync.WaitGroup
@@ -40,7 +42,7 @@ var (
 )
 
 // ----------------------------------------------------------------------
-// 2) TYPES FROM license(1).go
+// TYPES FROM THE MAVEN LICENSE CHECKER (license(1).go)
 // ----------------------------------------------------------------------
 
 type fetchRequest struct {
@@ -54,22 +56,6 @@ type fetchResult struct {
 	POM     *MavenPOM
 	UsedURL string
 	Err     error
-}
-
-var spdxLicenseMap = map[string]struct {
-	Name     string
-	Copyleft bool
-}{
-	"MIT":          {Name: "MIT License", Copyleft: false},
-	"Apache-2.0":   {Name: "Apache License 2.0", Copyleft: false},
-	"BSD-2-CLAUSE": {Name: "BSD 2-Clause", Copyleft: false},
-	"BSD-3-CLAUSE": {Name: "BSD 3-Clause", Copyleft: false},
-	"MPL-2.0":      {Name: "Mozilla Public License 2.0", Copyleft: true},
-	"LGPL-2.1":     {Name: "GNU Lesser GPL v2.1", Copyleft: true},
-	"LGPL-3.0":     {Name: "GNU Lesser GPL v3.0", Copyleft: true},
-	"GPL-2.0":      {Name: "GNU GPL v2.0", Copyleft: true},
-	"GPL-3.0":      {Name: "GNU GPL v3.0", Copyleft: true},
-	"AGPL-3.0":     {Name: "GNU Affero GPL v3.0", Copyleft: true},
 }
 
 type License struct {
@@ -99,6 +85,7 @@ type MavenPOM struct {
 	} `xml:"parent"`
 }
 
+// A single node in the BFS tree for Java/TOML/Gradle
 type DependencyNode struct {
 	Name       string
 	Version    string
@@ -110,6 +97,7 @@ type DependencyNode struct {
 	Direct     string
 }
 
+// ExtendedDep is used in the map form
 type ExtendedDep struct {
 	Display      string
 	Lookup       string
@@ -119,6 +107,7 @@ type ExtendedDep struct {
 	PomURL       string
 }
 
+// For each discovered file (pom.xml, .toml, build.gradle), we store its BFS results here.
 type ReportSection struct {
 	FilePath        string
 	DirectDeps      map[string]string
@@ -132,7 +121,7 @@ type ReportSection struct {
 }
 
 // ----------------------------------------------------------------------
-// 3) FILE DISCOVERY & PARSING (Java/TOML/Gradle)
+// MAVEN/TOML/GRADLE DISCOVERY & PARSING (from license(1).go)
 // ----------------------------------------------------------------------
 
 func findAllPOMFiles(root string) ([]string, error) {
@@ -334,7 +323,7 @@ func parseVersionRange(v string) string {
 }
 
 // ----------------------------------------------------------------------
-// 4) BFS & LICENSE FETCH (Java/TOML/Gradle)
+// MAVEN BFS & REMOTE FETCH LOGIC
 // ----------------------------------------------------------------------
 
 func skipScope(scope, optional string) bool {
@@ -352,31 +341,13 @@ func splitGA(ga string) (string, string) {
 	return parts[0], parts[1]
 }
 
-func setIntroducedBy(node *DependencyNode, rootName string, all map[string]ExtendedDep) {
-	for _, child := range node.Transitive {
-		key := child.Name + "@" + child.Version
-		inf := all[key]
-		if inf.IntroducedBy == "" {
-			inf.IntroducedBy = rootName
-		} else if !strings.Contains(inf.IntroducedBy, rootName) {
-			inf.IntroducedBy += ", " + rootName
-		}
-		all[key] = inf
-		setIntroducedBy(child, rootName, all)
-	}
-}
-
-// ----------------------------------------------------------------------
-// 5) REMOTE FETCH FOR POM
-// ----------------------------------------------------------------------
-
 func fetchRemotePOM(group, artifact, version string) (*MavenPOM, string, error) {
 	groupPath := strings.ReplaceAll(group, ".", "/")
 	urlCentral := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, artifact, version, artifact, version)
 	urlGoogle := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, artifact, version, artifact, version)
 	client := http.Client{Timeout: fetchTimeout}
 
-	log.Printf("[FETCH-REMOTE] Trying Maven Central => %s\n", urlCentral)
+	log.Printf("[FETCH-REMOTE] Trying Maven Central => %s", urlCentral)
 	resp, err := client.Get(urlCentral)
 	if err == nil && resp.StatusCode == 200 {
 		defer resp.Body.Close()
@@ -388,14 +359,14 @@ func fetchRemotePOM(group, artifact, version string) (*MavenPOM, string, error) 
 		if err := xml.Unmarshal(data, &pom); err != nil {
 			return nil, "", err
 		}
-		log.Printf("[FETCH-REMOTE] SUCCESS from Maven Central for %s:%s:%s\n", group, artifact, version)
+		log.Printf("[FETCH-REMOTE] SUCCESS from Maven Central for %s:%s:%s", group, artifact, version)
 		return &pom, urlCentral, nil
 	}
 	if resp != nil {
 		resp.Body.Close()
 	}
 
-	log.Printf("[FETCH-REMOTE] Trying Google Maven => %s\n", urlGoogle)
+	log.Printf("[FETCH-REMOTE] Trying Google Maven => %s", urlGoogle)
 	resp2, err2 := client.Get(urlGoogle)
 	if err2 == nil && resp2.StatusCode == 200 {
 		defer resp2.Body.Close()
@@ -407,20 +378,20 @@ func fetchRemotePOM(group, artifact, version string) (*MavenPOM, string, error) 
 		if err := xml.Unmarshal(data, &pom); err != nil {
 			return nil, "", err
 		}
-		log.Printf("[FETCH-REMOTE] SUCCESS from Google Maven for %s:%s:%s\n", group, artifact, version)
+		log.Printf("[FETCH-REMOTE] SUCCESS from Google Maven for %s:%s:%s", group, artifact, version)
 		return &pom, urlGoogle, nil
 	}
 	if resp2 != nil {
 		resp2.Body.Close()
 	}
-	log.Printf("[FETCH-REMOTE] FAILED for %s:%s:%s\n", group, artifact, version)
+	log.Printf("[FETCH-REMOTE] FAILED for %s:%s:%s", group, artifact, version)
 	return nil, "", fmt.Errorf("could not fetch POM for %s:%s:%s", group, artifact, version)
 }
 
 func concurrentFetchPOM(group, artifact, version string) (*MavenPOM, string, error) {
 	key := fmt.Sprintf("%s:%s:%s", group, artifact, version)
 	if cached, ok := pomCache.Load(key); ok {
-		log.Printf("[FETCH-CACHE] HIT => %s\n", key)
+		log.Printf("[FETCH-CACHE] HIT => %s", key)
 		return cached.(*MavenPOM), "", nil
 	}
 	channelMutex.Lock()
@@ -428,7 +399,7 @@ func concurrentFetchPOM(group, artifact, version string) (*MavenPOM, string, err
 	channelMutex.Unlock()
 
 	if !open {
-		log.Printf("[FETCH] Channel closed => direct fetch => %s\n", key)
+		log.Printf("[FETCH] Channel closed => direct fetch => %s", key)
 		pom, urlUsed, err := fetchRemotePOM(group, artifact, version)
 		if err == nil && pom != nil {
 			pomCache.Store(key, pom)
@@ -442,7 +413,7 @@ func concurrentFetchPOM(group, artifact, version string) (*MavenPOM, string, err
 		Version:    version,
 		ResultChan: make(chan fetchResult, 1),
 	}
-	log.Printf("[FETCH] Enqueue => %s\n", key)
+	log.Printf("[FETCH] Enqueue => %s", key)
 	pomRequests <- req
 	res := <-req.ResultChan
 	if res.Err == nil && res.POM != nil {
@@ -455,14 +426,14 @@ func pomFetchWorker() {
 	defer wgWorkers.Done()
 	for req := range pomRequests {
 		key := fmt.Sprintf("%s:%s:%s", req.GroupID, req.ArtifactID, req.Version)
-		log.Printf("[WORKER] Processing => %s\n", key)
+		log.Printf("[WORKER] Processing => %s", key)
 		pom, usedURL, err := fetchRemotePOM(req.GroupID, req.ArtifactID, req.Version)
 		req.ResultChan <- fetchResult{POM: pom, UsedURL: usedURL, Err: err}
 	}
 }
 
 // ----------------------------------------------------------------------
-// 6) BFS FOR TRANSITIVE CLOSURE (Java/TOML/Gradle)
+// BUILD TRANSITIVE CLOSURE FOR MAVEN/TOML/GRADLE
 // ----------------------------------------------------------------------
 
 type queueItem struct {
@@ -476,19 +447,16 @@ type queueItem struct {
 func buildTransitiveClosure(sections []ReportSection) {
 	for i := range sections {
 		sec := &sections[i]
-		log.Printf("[BFS] Building transitive closure for %s\n", sec.FilePath)
+		log.Printf("[BFS] Building transitive closure for %s", sec.FilePath)
 		allDeps := make(map[string]ExtendedDep)
 
-		// add direct dependencies
+		// Add direct dependencies
 		for ga, ver := range sec.DirectDeps {
 			key := ga + "@" + ver
 			allDeps[key] = ExtendedDep{
-				Display:      ver,
-				Lookup:       ver,
-				Parent:       "direct",
-				License:      "",
-				IntroducedBy: "",
-				PomURL:       "",
+				Display: ver,
+				Lookup:  ver,
+				Parent:  "direct",
 			}
 		}
 
@@ -496,7 +464,7 @@ func buildTransitiveClosure(sections []ReportSection) {
 		var queue []queueItem
 		var rootNodes []*DependencyNode
 
-		// initialize BFS with direct
+		// Initialize BFS with direct deps
 		for ga, ver := range sec.DirectDeps {
 			key := ga + "@" + ver
 			directName := ga
@@ -523,7 +491,7 @@ func buildTransitiveClosure(sections []ReportSection) {
 		for len(queue) > 0 {
 			it := queue[0]
 			queue = queue[1:]
-			log.Printf("[BFS] Processing => %s@%s (depth=%d, direct=%s)\n",
+			log.Printf("[BFS] Processing => %s@%s (depth=%d, direct=%s)",
 				it.GroupArtifact, it.Version, it.Depth, it.Direct)
 
 			group, artifact := splitGA(it.GroupArtifact)
@@ -584,15 +552,18 @@ func buildTransitiveClosure(sections []ReportSection) {
 			}
 		}
 
+		// Mark introducedBy
 		for _, node := range rootNodes {
 			setIntroducedBy(node, node.Name, allDeps)
 		}
 
+		// Flatten BFS data back to sec.AllDeps
 		for k, v := range allDeps {
 			sec.AllDeps[k] = v
 		}
 		sec.DependencyTree = rootNodes
 
+		// Count stats
 		sec.DirectCount = len(sec.DirectDeps)
 		sec.TransitiveCount = 0
 		sec.IndirectCount = 0
@@ -651,8 +622,19 @@ func countCopyleftInTree(node *DependencyNode, sec *ReportSection) {
 }
 
 // ----------------------------------------------------------------------
-// 7) CODE FROM checker.go (Node & Python BFS)
+// NODE/PYTHON CODE (from checker.go) - BFS expansions
 // ----------------------------------------------------------------------
+
+// NodeDependency is already BFS-like: we have a Transitive slice.
+type NodeDependency struct {
+	Name       string
+	Version    string
+	License    string
+	Details    string
+	Copyleft   bool
+	Transitive []*NodeDependency
+	Language   string
+}
 
 func findFile(root, target string) string {
 	var found string
@@ -685,17 +667,7 @@ func removeCaretTilde(ver string) string {
 	return strings.TrimLeft(ver, "^~")
 }
 
-// Node BFS
-type NodeDependency struct {
-	Name       string
-	Version    string
-	License    string
-	Details    string
-	Copyleft   bool
-	Transitive []*NodeDependency
-	Language   string
-}
-
+// Fallback approach to scrape the npm package page if needed:
 func fallbackNpmLicenseMultiLine(pkgName string) string {
 	url := "https://www.npmjs.com/package/" + pkgName
 	resp, err := http.Get(url)
@@ -754,6 +726,7 @@ func findNpmLicense(verData map[string]interface{}) string {
 	return "Unknown"
 }
 
+// parseNodeDependencies does BFS by calling resolveNodeDependency, which recursively sets .Transitive
 func parseNodeDependencies(nodeFile string) ([]*NodeDependency, error) {
 	raw, err := os.ReadFile(nodeFile)
 	if err != nil {
@@ -797,6 +770,7 @@ func resolveNodeDependency(pkgName, version string, visited map[string]bool) (*N
 	if e := json.NewDecoder(resp.Body).Decode(&data); e != nil {
 		return nil, e
 	}
+	// If version not specified, fallback to dist-tags.latest
 	if version == "" {
 		if dist, ok := data["dist-tags"].(map[string]interface{}); ok {
 			if lat, ok := dist["latest"].(string); ok {
@@ -810,6 +784,7 @@ func resolveNodeDependency(pkgName, version string, visited map[string]bool) (*N
 	}
 	verData, ok := vs[version].(map[string]interface{})
 	if !ok {
+		// fallback to "latest" if exact version not found
 		if dist, ok2 := data["dist-tags"].(map[string]interface{}); ok2 {
 			if lat, ok2 := dist["latest"].(string); ok2 {
 				if vMap, ok3 := vs[lat].(map[string]interface{}); ok3 {
@@ -822,7 +797,6 @@ func resolveNodeDependency(pkgName, version string, visited map[string]bool) (*N
 			}
 		}
 	}
-
 	license := "Unknown"
 	var trans []*NodeDependency
 
@@ -997,7 +971,6 @@ func resolvePythonDependency(pkgName, version string, visited map[string]bool) (
 				log.Printf("WARNING: requires_dist item is not a string: %#v in package %s", x, pkgName)
 				continue
 			}
-			// replaced subVer with _ to avoid "declared and not used"
 			subName, _ := parsePyRequiresDistLine(line)
 			if subName == "" {
 				log.Printf("WARNING: parsePyRequiresDistLine failed for line: '%s' in package %s", line, pkgName)
@@ -1026,110 +999,150 @@ func resolvePythonDependency(pkgName, version string, visited map[string]bool) (
 }
 
 // ----------------------------------------------------------------------
-// 8) FINAL TEMPLATE FOR MERGED REPORT
+// FINAL HTML TEMPLATE - COMBINED BFS REPORT
 // ----------------------------------------------------------------------
+//
+// The user wants a single HTML that looks like a "combination of both reports"
+// with BFS expansions for Java/TOML/Gradle (License Checker) and BFS expansions
+// for Node/Python (Dependency Checker), plus the headings from both codes.
 
 var mergedReportTmpl = `
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="utf-8">
-    <title>License Compliance Report</title>
+    <title>Combined Dependency Report</title>
     <style>
     body { font-family: Arial, sans-serif; }
+    h1, h2, h3 { margin-top: 1em; }
     .copyleft { background-color: #ffe6e6; }
     .unknown { background-color: #ffffcc; }
-    h1 { color: #333; margin-top: 0; }
-    table { border-collapse: collapse; width: 95%; margin: 20px 0; }
-    th, td { border: 1px solid #ccc; padding: 6px 8px; }
-    th { background: #f7f7f7; }
-    .indent { margin-left: 20px; }
+    ul { list-style-type: disc; margin-left: 2em; }
+    li { margin-bottom: 0.5em; }
+    .indent { margin-left: 1em; }
+    a { text-decoration: none; color: #337ab7; }
+    a:hover { text-decoration: underline; }
     </style>
 </head>
 <body>
 
-<!-- Java/TOML/Gradle results -->
-<h1>Java/TOML/Gradle License Report</h1>
+<h1>Combined Dependency Report</h1>
+
+<!-- 1) LICENSE CHECKER RESULTS (Maven/TOML/Gradle) -->
+<h2>License Checker Results</h2>
 {{range .JavaSections}}
-<h2>{{.FilePath}}</h2>
+<h3>{{.FilePath}}</h3>
 <p>
-  Direct: {{.DirectCount}} <br/>
-  Transitive (incl. direct): {{.TransitiveCount}} <br/>
-  Indirect: {{.IndirectCount}} <br/>
-  Copyleft: {{.CopyleftCount}} <br/>
-  Unknown: {{.UnknownCount}}
+  Direct Dependencies: {{.DirectCount}}<br/>
+  Transitive (including direct): {{.TransitiveCount}}<br/>
+  Indirect: {{.IndirectCount}}<br/>
+  Copyleft: {{.CopyleftCount}}<br/>
+  Unknown Version: {{.UnknownCount}}
 </p>
 <ul>
-  {{range .DependencyTree}}
-    <li>
-      <strong>{{.Name}}@{{.Version}}</strong>
-      {{if eq .Parent "direct"}}(direct){{else}}(introduced by {{.Parent}}){{end}}
-      <br/>
-      License: <span {{if .Copyleft}}class="copyleft"{{else if eq .License "Unknown"}}class="unknown"{{end}}>{{.License}}</span>
-      {{if .UsedPOMURL}} [<a href="{{.UsedPOMURL}}" target="_blank">POM</a>]{{end}}
-      <div class="indent">{{template "transitive" .Transitive}}</div>
-    </li>
-  {{end}}
+{{range .DependencyTree}}
+  <li>
+    <strong>{{.Name}}@{{.Version}}</strong>
+    {{if eq .Parent "direct"}}(direct){{else}}(introduced by {{.Parent}}){{end}}
+    <br/>
+    License: <span {{if .Copyleft}}class="copyleft"{{else if eq .License "Unknown"}}class="unknown"{{end}}>{{.License}}</span>
+    {{if .UsedPOMURL}} [<a href="{{.UsedPOMURL}}" target="_blank">POM</a>]{{end}}
+    {{template "depTree" .Transitive}}
+  </li>
+{{end}}
 </ul>
 <hr/>
 {{end}}
 
-{{define "transitive"}}
+{{define "depTree"}}
 <ul>
-  {{range .}}
+{{range .}}
   <li>
     <strong>{{.Name}}@{{.Version}}</strong>
     <br/>
     License: <span {{if .Copyleft}}class="copyleft"{{else if eq .License "Unknown"}}class="unknown"{{end}}>{{.License}}</span>
     {{if .UsedPOMURL}} [<a href="{{.UsedPOMURL}}" target="_blank">POM</a>]{{end}}
-    <div class="indent">{{template "transitive" .Transitive}}</div>
+    {{template "depTree" .Transitive}}
   </li>
-  {{end}}
+{{end}}
 </ul>
 {{end}}
 
-<!-- Node & Python results -->
-<h1>Node/Python Dependency Report</h1>
-<h2>Node Dependencies</h2>
-<table>
-  <tr>
-    <th>Name</th><th>Version</th><th>License</th><th>Details</th>
-  </tr>
-  {{range .NodeDeps}}
-  <tr>
-    <td>{{.Name}}</td>
-    <td>{{.Version}}</td>
-    <td {{if .Copyleft}}class="copyleft"{{end}}>{{.License}}</td>
-    <td><a href="{{.Details}}" target="_blank">Link</a></td>
-  </tr>
-  {{end}}
-</table>
+<!-- 2) DEPENDENCY CHECKER RESULTS (Node/Python) -->
+<h2>Dependency Checker Results</h2>
 
-<h2>Python Dependencies</h2>
-<table>
-  <tr>
-    <th>Name</th><th>Version</th><th>License</th><th>Details</th>
-  </tr>
-  {{range .PyDeps}}
-  <tr>
-    <td>{{.Name}}</td>
-    <td>{{.Version}}</td>
-    <td {{if .Copyleft}}class="copyleft"{{end}}>{{.License}}</td>
-    <td><a href="{{.Details}}" target="_blank">Link</a></td>
-  </tr>
-  {{end}}
-</table>
+<!-- Node BFS -->
+{{if .NodeDeps}}
+<h3>Node Dependencies</h3>
+<ul>
+{{range .NodeDeps}}
+  <li>
+    <strong>{{.Name}}@{{.Version}}</strong>
+    <br/>
+    License: <span {{if .Copyleft}}class="copyleft"{{else if eq .License "Unknown"}}class="unknown"{{end}}>{{.License}}</span>
+    {{if .Details}} [<a href="{{.Details}}" target="_blank">Details</a>]{{end}}
+    {{template "nodeTree" .Transitive}}
+  </li>
+{{end}}
+</ul>
+<hr/>
+{{end}}
+
+{{define "nodeTree"}}
+<ul>
+{{range .}}
+  <li>
+    <strong>{{.Name}}@{{.Version}}</strong>
+    <br/>
+    License: <span {{if .Copyleft}}class="copyleft"{{else if eq .License "Unknown"}}class="unknown"{{end}}>{{.License}}</span>
+    {{if .Details}} [<a href="{{.Details}}" target="_blank">Details</a>]{{end}}
+    {{template "nodeTree" .Transitive}}
+  </li>
+{{end}}
+</ul>
+{{end}}
+
+<!-- Python BFS -->
+{{if .PyDeps}}
+<h3>Python Dependencies</h3>
+<ul>
+{{range .PyDeps}}
+  <li>
+    <strong>{{.Name}}@{{.Version}}</strong>
+    <br/>
+    License: <span {{if .Copyleft}}class="copyleft"{{else if eq .License "Unknown"}}class="unknown"{{end}}>{{.License}}</span>
+    {{if .Details}} [<a href="{{.Details}}" target="_blank">Details</a>]{{end}}
+    {{template "pyTree" .Transitive}}
+  </li>
+{{end}}
+</ul>
+<hr/>
+{{end}}
+
+{{define "pyTree"}}
+<ul>
+{{range .}}
+  <li>
+    <strong>{{.Name}}@{{.Version}}</strong>
+    <br/>
+    License: <span {{if .Copyleft}}class="copyleft"{{else if eq .License "Unknown"}}class="unknown"{{end}}>{{.License}}</span>
+    {{if .Details}} [<a href="{{.Details}}" target="_blank">Details</a>]{{end}}
+    {{template "pyTree" .Transitive}}
+  </li>
+{{end}}
+</ul>
+{{end}}
 
 </body>
 </html>
 `
 
 // ----------------------------------------------------------------------
-// 9) MAIN FUNCTION
+// MAIN: Merge Everything, Produce Single HTML
 // ----------------------------------------------------------------------
 
 func main() {
-	// Start pom fetch workers
+	// 1) Start workers for Maven BFS
 	for i := 0; i < pomWorkerCount; i++ {
 		wgWorkers.Add(1)
 		go pomFetchWorker()
@@ -1137,22 +1150,22 @@ func main() {
 
 	rootDir := "."
 
-	// 1) Parse Java/TOML/Gradle
+	// 2) Collect Java/TOML/Gradle sections
 	var sections []ReportSection
 
 	pomFiles, _ := findAllPOMFiles(rootDir)
 	for _, pf := range pomFiles {
 		deps, err := parseOneLocalPOMFile(pf)
 		if err != nil {
-			log.Println("Error parsing POM:", err)
+			log.Println("Error parsing pom.xml:", err)
 			continue
 		}
-		sec := ReportSection{
+		rs := ReportSection{
 			FilePath:   pf,
 			DirectDeps: deps,
 			AllDeps:    make(map[string]ExtendedDep),
 		}
-		sections = append(sections, sec)
+		sections = append(sections, rs)
 	}
 
 	tomlFiles, _ := findAllTOMLFiles(rootDir)
@@ -1162,12 +1175,12 @@ func main() {
 			log.Println("Error parsing TOML:", err)
 			continue
 		}
-		sec := ReportSection{
+		rs := ReportSection{
 			FilePath:   tf,
 			DirectDeps: deps,
 			AllDeps:    make(map[string]ExtendedDep),
 		}
-		sections = append(sections, sec)
+		sections = append(sections, rs)
 	}
 
 	gradleFiles, _ := findAllGradleFiles(rootDir)
@@ -1177,18 +1190,18 @@ func main() {
 			log.Println("Error parsing Gradle:", err)
 			continue
 		}
-		sec := ReportSection{
+		rs := ReportSection{
 			FilePath:   gf,
 			DirectDeps: deps,
 			AllDeps:    make(map[string]ExtendedDep),
 		}
-		sections = append(sections, sec)
+		sections = append(sections, rs)
 	}
 
-	// Build BFS
+	// BFS for the Java/TOML/Gradle sections
 	buildTransitiveClosure(sections)
 
-	// 2) Parse Node
+	// 3) Collect Node BFS
 	nodeFile := findFile(rootDir, "package.json")
 	var nodeDeps []*NodeDependency
 	if nodeFile != "" {
@@ -1200,7 +1213,7 @@ func main() {
 		}
 	}
 
-	// 3) Parse Python
+	// 4) Collect Python BFS
 	pyFile := findFile(rootDir, "requirements.txt")
 	var pyDeps []*PythonDependency
 	if pyFile != "" {
@@ -1212,11 +1225,11 @@ func main() {
 		}
 	}
 
-	// Close channel & wait for BFS workers
+	// Done BFS => close channel, wait for workers
 	close(pomRequests)
 	wgWorkers.Wait()
 
-	// 4) Render single HTML
+	// 5) Render single HTML with both BFS expansions
 	type finalData struct {
 		JavaSections []ReportSection
 		NodeDeps     []*NodeDependency
@@ -1228,21 +1241,20 @@ func main() {
 		PyDeps:       pyDeps,
 	}
 
-	f, err := os.Create(outputReportFinal)
+	f, err := os.Create(finalHTMLFilename)
 	if err != nil {
 		log.Fatalf("Cannot create final HTML report: %v", err)
 	}
 	defer f.Close()
 
-	tmpl, err := template.New("merged").Parse(mergedReportTmpl)
+	tmpl, err := template.New("combined").Parse(mergedReportTmpl)
 	if err != nil {
 		log.Fatalf("Error parsing merged template: %v", err)
 	}
 
-	err = tmpl.Execute(f, fd)
-	if err != nil {
+	if err := tmpl.Execute(f, fd); err != nil {
 		log.Fatalf("Error executing merged template: %v", err)
 	}
 
-	fmt.Println("License compliance report generated at:", outputReportFinal)
+	fmt.Println("Combined BFS dependency report generated at:", finalHTMLFilename)
 }
