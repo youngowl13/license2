@@ -433,7 +433,6 @@ func fetchRemotePOM(group, artifact, version string) (*MavenPOM, string, error) 
 	if resp != nil {
 		resp.Body.Close()
 	}
-
 	resp2, err2 := client.Get(urlGoogle)
 	if err2 == nil && resp2.StatusCode == 200 {
 		defer resp2.Body.Close()
@@ -615,7 +614,7 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 		for _, root := range rootNodes {
 			countCopyleftInTree(root, sec)
 		}
-		// Sort the BFS tree nodes recursively
+		// Recursively sort the BFS tree nodes
 		for _, root := range sec.DependencyTree {
 			sortDependencyNodes(root)
 		}
@@ -642,30 +641,6 @@ func countCopyleftInTree(node *DependencyNode, sec *ReportSection) {
 	}
 	for _, child := range node.Transitive {
 		countCopyleftInTree(child, sec)
-	}
-}
-
-// sortDependencyNodes recursively sorts nodes so that copyleft (red) come first, then unknown (yellow), then known (green).
-func sortDependencyNodes(node *DependencyNode) {
-	// sort current node's children
-	sort.Slice(node.Transitive, func(i, j int) bool {
-		rank := func(n *DependencyNode) int {
-			if n.Copyleft {
-				return 0
-			} else if strings.EqualFold(n.License, "unknown") {
-				return 1
-			}
-			return 2
-		}
-		ri, rj := rank(node.Transitive[i]), rank(node.Transitive[j])
-		if ri != rj {
-			return ri < rj
-		}
-		return node.Transitive[i].Name < node.Transitive[j].Name
-	})
-	// recursively sort each child
-	for _, child := range node.Transitive {
-		sortDependencyNodes(child)
 	}
 }
 
@@ -834,8 +809,7 @@ func parsePythonDependencies(reqFile string) ([]*DependencyNode, error) {
 
 func parsePyRequiresDistLine(line string) (string, string) {
 	parts := strings.FieldsFunc(line, func(r rune) bool {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
 			return false
 		}
 		return true
@@ -852,6 +826,7 @@ func resolvePythonDependency(pkgName, version string, visited map[string]bool) (
 		return nil, nil
 	}
 	visited[key] = true
+	// Check pythonCache
 	if val, ok := pythonCache.Load(key); ok {
 		return val.(*DependencyNode), nil
 	}
@@ -925,13 +900,10 @@ func flattenBFS(sec *ReportSection) {
 	var walk func(node *DependencyNode)
 	walk = func(node *DependencyNode) {
 		var detail string
-		// Determine "Project Details" based on file type inferred from sec.FilePath
 		lowerPath := strings.ToLower(sec.FilePath)
 		if strings.HasSuffix(lowerPath, "pom.xml") || strings.HasSuffix(lowerPath, "build.gradle") || strings.HasSuffix(lowerPath, ".toml") {
-			// Maven: show non-clickable details from original parser (simulate as "Module: <Name> v<Version>")
 			detail = fmt.Sprintf("Module: %s v%s", node.Name, node.Version)
 		} else if strings.Contains(lowerPath, "package.json") || strings.Contains(lowerPath, "requirements.txt") {
-			// Node/Python: show package page link as is
 			detail = node.UsedPOMURL
 		} else {
 			detail = node.UsedPOMURL
@@ -1203,7 +1175,7 @@ func main() {
 	close(pomRequests)
 	wgWorkers.Wait()
 
-	// Flatten BFS trees into table rows.
+	// Flatten each BFS tree into table rows.
 	for i := range sections {
 		flattenBFS(&sections[i])
 	}
