@@ -40,7 +40,6 @@ var (
 // 2) COMMON TYPES FOR DEPENDENCY TREES & REPORTS
 // ----------------------------------------------------------------------
 
-// DependencyNode represents a dependency in the BFS tree.
 type DependencyNode struct {
 	Name       string
 	Version    string
@@ -52,7 +51,6 @@ type DependencyNode struct {
 	Direct     string            // Top-level dependency that introduced this node
 }
 
-// ExtendedDep holds flattened info.
 type ExtendedDep struct {
 	Display      string
 	Lookup       string
@@ -62,7 +60,6 @@ type ExtendedDep struct {
 	PomURL       string
 }
 
-// ReportSection holds the dependency tree and flattened table for one file.
 type ReportSection struct {
 	FilePath        string
 	DirectDeps      map[string]string // e.g. "group/artifact" => version
@@ -78,7 +75,6 @@ type ReportSection struct {
 	Flattened []FlattenedDep // Flattened table rows
 }
 
-// FlattenedDep represents one row in the final table.
 type FlattenedDep struct {
 	Dependency string
 	Version    string
@@ -86,17 +82,15 @@ type FlattenedDep struct {
 	TopLevel   string
 	License    string
 	Copyleft   bool
-	Details    string // Link (Maven POM or Node/Python details)
+	Details    string // e.g. Node/Python details or Maven POM link
 }
 
-// introducerSet is used during BFS bookkeeping.
 type introducerSet map[string]bool
 
 // ----------------------------------------------------------------------
 // 3) TYPES FOR MAVEN FETCHING
 // ----------------------------------------------------------------------
 
-// fetchRequest is used to enqueue remote fetch requests.
 type fetchRequest struct {
 	GroupID    string
 	ArtifactID string
@@ -104,7 +98,6 @@ type fetchRequest struct {
 	ResultChan chan fetchResult
 }
 
-// fetchResult holds the result of a remote fetch.
 type fetchResult struct {
 	POM     *MavenPOM
 	UsedURL string
@@ -638,10 +631,6 @@ func countCopyleftInTree(node *DependencyNode, sec *ReportSection) {
 // 10) NODE & PYTHON BFS PARSING (FULL TRANSITIVE EXPANSION)
 // ----------------------------------------------------------------------
 
-type requirement struct {
-	name, version string
-}
-
 func parseNodeDependencies(nodeFile string) ([]*DependencyNode, error) {
 	data, err := os.ReadFile(nodeFile)
 	if err != nil {
@@ -873,7 +862,7 @@ func resolvePythonDependency(pkgName, version string, visited map[string]bool) (
 }
 
 // ----------------------------------------------------------------------
-// 10) FLATTEN BFS TREE INTO TABLE ROWS
+// 11) FLATTEN BFS TREE INTO TABLE ROWS
 // ----------------------------------------------------------------------
 
 func flattenBFS(sec *ReportSection) {
@@ -901,7 +890,7 @@ func flattenBFS(sec *ReportSection) {
 }
 
 // ----------------------------------------------------------------------
-// 11) FINAL HTML TEMPLATE (TABLE FIRST, THEN COLLAPSIBLE BFS)
+// 12) FINAL HTML TEMPLATE (TABLE FIRST, THEN COLLAPSIBLE BFS)
 // ----------------------------------------------------------------------
 
 var finalHTML = `
@@ -938,87 +927,84 @@ var finalHTML = `
 </head>
 <body>
 <h1>Combined Dependency Report</h1>
-
 {{range .Sections}}
-<h2>{{.FilePath}}</h2>
-<p>
-  Direct Dependencies: {{.DirectCount}}<br/>
-  Transitive (incl. direct): {{.TransitiveCount}}<br/>
-  Indirect: {{.IndirectCount}}<br/>
-  Copyleft: {{.CopyleftCount}}<br/>
-  Unknown: {{.UnknownCount}}
-</p>
+  {{$filePath := .FilePath}}
+  <h2>{{$filePath}}</h2>
+  <p>
+    Direct Dependencies: {{.DirectCount}}<br/>
+    Transitive (incl. direct): {{.TransitiveCount}}<br/>
+    Indirect: {{.IndirectCount}}<br/>
+    Copyleft: {{.CopyleftCount}}<br/>
+    Unknown: {{.UnknownCount}}
+  </p>
+  <!-- Table First -->
+  <h3>Dependency Table</h3>
+  <table>
+    <tr>
+      <th>Dependency</th>
+      <th>Version</th>
+      <th>Parent</th>
+      <th>Top-Level</th>
+      <th>License</th>
+      <th>Details</th>
+    </tr>
+    {{range .Flattened}}
+    <tr {{if .Copyleft}}class="copyleft"{{else if eq .License "Unknown"}}class="unknown"{{end}}>
+      <td>{{.Dependency}}</td>
+      <td>{{.Version}}</td>
+      <td>{{.Parent}}</td>
+      <td>{{.TopLevel}}</td>
+      <td>{{.License}}</td>
+      <td>{{if .Details}}<a href="{{.Details}}" target="_blank">Link</a>{{end}}</td>
+    </tr>
+    {{end}}
+  </table>
+  <!-- Collapsible BFS Tree -->
+  <h3>Dependency Tree</h3>
+  <ul class="tree">
+    {{range $i, $root := .DependencyTree}}
+    <li class="tree-item">
+      <span class="toggle-btn" onclick="toggleSubtree('node-{{$filePath}}-{{$i}}')">[+/-]</span>
+      <strong>{{$root.Name}}@{{$root.Version}}</strong>
+      {{if eq $root.Parent "direct"}}(direct){{else}}(introduced by {{$root.Parent}}){{end}}
+      <br/>
+      License: <span {{if $root.Copyleft}}class="copyleft"{{else if eq $root.License "Unknown"}}class="unknown"{{end}}>{{$root.License}}</span>
+      {{if $root.UsedPOMURL}} [<a href="{{$root.UsedPOMURL}}" target="_blank">Link</a>]{{end}}
+      {{if $root.Transitive}}
+      <ul class="hidden" id="node-{{$filePath}}-{{$i}}">
+        {{template "subTree" $root.Transitive $filePath (print $i)}}
+      </ul>
+      {{end}}
+    </li>
+    {{end}}
+  </ul>
+  <hr/>
+{{end}}
 
-<!-- 1) TABLE FIRST -->
-<h3>Dependency Table</h3>
-<table>
-  <tr>
-    <th>Dependency</th>
-    <th>Version</th>
-    <th>Parent</th>
-    <th>Top-Level</th>
-    <th>License</th>
-    <th>Details</th>
-  </tr>
-  {{range .Flattened}}
-  <tr {{if .Copyleft}}class="copyleft"{{else if eq .License "Unknown"}}class="unknown"{{end}}>
-    <td>{{.Dependency}}</td>
-    <td>{{.Version}}</td>
-    <td>{{.Parent}}</td>
-    <td>{{.TopLevel}}</td>
-    <td>{{.License}}</td>
-    <td>{{if .Details}}<a href="{{.Details}}" target="_blank">Link</a>{{end}}</td>
-  </tr>
-  {{end}}
-</table>
-
-<!-- 2) COLLAPSIBLE BFS TREE -->
-<h3>Dependency Tree</h3>
-<ul class="tree">
-  {{range $i, $root := .DependencyTree}}
+{{define "subTree"}}
+  {{- $file := index . 1 -}}
+  {{- $prefix := index . 2 -}}
+  {{- $nodes := index . 0 -}}
+  {{range $j, $child := $nodes}}
   <li class="tree-item">
-    <span class="toggle-btn" onclick="toggleSubtree('node-{{$.FilePath}}-{{$i}}')">[+/-]</span>
-    <strong>{{$root.Name}}@{{$root.Version}}</strong>
-    {{if eq $root.Parent "direct"}}(direct){{else}}(introduced by {{$root.Parent}}){{end}}
-    <br/>
-    License: <span {{if $root.Copyleft}}class="copyleft"{{else if eq $root.License "Unknown"}}class="unknown"{{end}}>{{$root.License}}</span>
-    {{if $root.UsedPOMURL}} [<a href="{{$root.UsedPOMURL}}" target="_blank">Link</a>]{{end}}
-    {{if $root.Transitive}}
-    <ul class="hidden" id="node-{{$.FilePath}}-{{$i}}">
-      {{template "subTree" $root.Transitive $.FilePath (print $i)}}
+    <span class="toggle-btn" onclick="toggleSubtree('sub-{{$file}}-{{$prefix}}-{{$j}}')">[+/-]</span>
+    <strong>{{$child.Name}}@{{$child.Version}}</strong><br/>
+    License: <span {{if $child.Copyleft}}class="copyleft"{{else if eq $child.License "Unknown"}}class="unknown"{{end}}>{{$child.License}}</span>
+    {{if $child.UsedPOMURL}} [<a href="{{$child.UsedPOMURL}}" target="_blank">Link</a>]{{end}}
+    {{if $child.Transitive}}
+    <ul class="hidden" id="sub-{{$file}}-{{$prefix}}-{{$j}}">
+      {{template "subTree" $child.Transitive $file (print $prefix "-" $j)}}
     </ul>
     {{end}}
   </li>
   {{end}}
-</ul>
-<hr/>
 {{end}}
-
-{{define "subTree"}}
-{{- $file := index . 1 -}}
-{{- $prefix := index . 2 -}}
-{{- $nodes := index . 0 -}}
-{{range $j, $child := $nodes}}
-<li class="tree-item">
-  <span class="toggle-btn" onclick="toggleSubtree('sub-{{$file}}-{{$prefix}}-{{$j}}')">[+/-]</span>
-  <strong>{{$child.Name}}@{{$child.Version}}</strong><br/>
-  License: <span {{if $child.Copyleft}}class="copyleft"{{else if eq $child.License "Unknown"}}class="unknown"{{end}}>{{$child.License}}</span>
-  {{if $child.UsedPOMURL}} [<a href="{{$child.UsedPOMURL}}" target="_blank">Link</a>]{{end}}
-  {{if $child.Transitive}}
-  <ul class="hidden" id="sub-{{$file}}-{{$prefix}}-{{$j}}">
-    {{template "subTree" $child.Transitive $file (print $prefix "-" $j)}}
-  </ul>
-  {{end}}
-</li>
-{{end}}
-{{end}}
-
 </body>
 </html>
 `
 
 // ----------------------------------------------------------------------
-// 12) MAIN FUNCTION
+// 13) MAIN FUNCTION
 // ----------------------------------------------------------------------
 
 func main() {
@@ -1089,7 +1075,7 @@ func main() {
 		sections = append(sections, rs)
 	}
 
-	// Build BFS for Maven/TOML/Gradle
+	// BFS expansions for Maven/TOML/Gradle
 	buildTransitiveClosureJavaLike(sections)
 
 	// Node Dependencies
@@ -1143,12 +1129,11 @@ func main() {
 	close(pomRequests)
 	wgWorkers.Wait()
 
-	// Flatten BFS trees to table rows.
+	// Flatten each BFS tree into table rows.
 	for i := range sections {
 		flattenBFS(&sections[i])
 	}
 
-	// Render final HTML.
 	type finalData struct {
 		Sections []ReportSection
 	}
