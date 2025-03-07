@@ -1,3 +1,4 @@
+// File: license_compliance_report.go
 package main
 
 import (
@@ -25,13 +26,12 @@ import (
 // ----------------------------------------------------------------------
 
 const (
-	localPOMCacheDir  = ".pom-cache"
-	pomWorkerCount    = 10
-	fetchTimeout      = 30 * time.Second
-	outputReportFinal = "license_compliance_report.html"
+	localPOMCacheDir       = ".pom-cache"
+	pomWorkerCount         = 10
+	fetchTimeout           = 30 * time.Second
+	outputReportFinal      = "license_compliance_report.html"
 )
 
-// For concurrency in Maven BFS
 var (
 	pomRequests  = make(chan fetchRequest, 50)
 	wgWorkers    sync.WaitGroup
@@ -40,7 +40,7 @@ var (
 	channelMutex sync.Mutex
 )
 
-// BFS concurrency request
+// BFS concurrency for Maven
 type fetchRequest struct {
 	GroupID    string
 	ArtifactID string
@@ -55,22 +55,20 @@ type fetchResult struct {
 }
 
 // ----------------------------------------------------------------------
-// 2) TYPES FOR THE BFS TREE & REPORT SECTIONS
+// 2) DEPENDENCY TREE & REPORT SECTIONS
 // ----------------------------------------------------------------------
 
-// We’ll use one BFS structure (DependencyNode) for *all* file types.
 type DependencyNode struct {
 	Name       string
 	Version    string
 	License    string
 	Copyleft   bool
-	Parent     string // "direct" or e.g. "com.foo/bar@1.0"
+	Parent     string // e.g. "direct" or "com.foo/bar@1.0"
 	Transitive []*DependencyNode
-	UsedPOMURL string // For Maven, store the actual POM URL. For Node/Python, store “Details” link
-	Direct     string
+	UsedPOMURL string // For Maven, the fetched POM link; for Node/Python, the "Details" link
+	Direct     string // BFS "root" name that introduced it
 }
 
-// ExtendedDep is used for flattening if needed.
 type ExtendedDep struct {
 	Display      string
 	Lookup       string
@@ -80,21 +78,40 @@ type ExtendedDep struct {
 	PomURL       string
 }
 
-// For each discovered file, we keep BFS expansions in one ReportSection.
 type ReportSection struct {
 	FilePath        string
-	DirectDeps      map[string]string // e.g. "com.google.guava/guava" => "31.1-jre"
+	DirectDeps      map[string]string // "group/artifact" => version
 	AllDeps         map[string]ExtendedDep
 	DependencyTree  []*DependencyNode
+
+	// BFS-based counts
 	TransitiveCount int
 	DirectCount     int
 	IndirectCount   int
 	CopyleftCount   int
 	UnknownCount    int
+
+	// Flattened view (for table-based format)
+	Flattened []FlattenedDep
 }
 
 // ----------------------------------------------------------------------
-// 3) MAVEN/TOML/GRADLE STRUCTS & PARSING
+// 3) FLATTENED DEP STRUCT (for the final HTML table rows)
+// ----------------------------------------------------------------------
+
+type FlattenedDep struct {
+	Dependency string // e.g. "com.google.guava/guava"
+	Version    string
+	Parent     string
+	TopLevel   string
+	License    string
+	Details    string // link for Node/Python
+	PomURL     string // link for Maven POM
+	Copyleft   bool
+}
+
+// ----------------------------------------------------------------------
+// 4) MAVEN/TOML/GRADLE STRUCTS & PARSING
 // ----------------------------------------------------------------------
 
 type License struct {
@@ -325,7 +342,7 @@ func parseVersionRange(v string) string {
 }
 
 // ----------------------------------------------------------------------
-// 4) NODE & PYTHON STRUCTS & PARSING
+// 5) NODE & PYTHON PARSING
 // ----------------------------------------------------------------------
 
 type NodeDependency struct {
@@ -348,6 +365,7 @@ type PythonDependency struct {
 	Language   string
 }
 
+// findFile is used for Node (`package.json`) & Python (`requirements.txt`)
 func findFile(root, target string) string {
 	var found string
 	filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
@@ -361,7 +379,7 @@ func findFile(root, target string) string {
 }
 
 // ----------------------------------------------------------------------
-// 5) HELPER: isCopyleftChecker, detectLicense
+// 6) UTILS: isCopyleftChecker, detectLicense
 // ----------------------------------------------------------------------
 
 func detectLicense(pom *MavenPOM) string {
@@ -388,7 +406,7 @@ func isCopyleftChecker(license string) bool {
 }
 
 // ----------------------------------------------------------------------
-// 6) BFS WORKER & REMOTE FETCH FOR MAVEN
+// 7) MAVEN BFS WORKER & REMOTE FETCH
 // ----------------------------------------------------------------------
 
 func skipScope(scope, optional string) bool {
@@ -404,7 +422,7 @@ func splitGA(ga string) (string, string) {
 	return parts[0], parts[1]
 }
 
-// We define the type that caused "undefined: introducerSet"
+// We'll define introducerSet to fix the "undefined" error
 type introducerSet map[string]bool
 
 func fetchRemotePOM(group, artifact, version string) (*MavenPOM, string, error) {
@@ -499,7 +517,7 @@ func pomFetchWorker() {
 }
 
 // ----------------------------------------------------------------------
-// 7) BFS "Maven-Style" for Maven/TOML/Gradle
+// 8) BFS FOR MAVEN/TOML/Gradle
 // ----------------------------------------------------------------------
 
 type queueItem struct {
@@ -516,16 +534,21 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 		log.Printf("[BFS] Building BFS for %s", sec.FilePath)
 
 		allDeps := make(map[string]ExtendedDep)
+		// add direct dependencies
 		for ga, ver := range sec.DirectDeps {
 			key := ga + "@" + ver
-			allDeps[key] = ExtendedDep{Display: ver, Lookup: ver, Parent: "direct"}
+			allDeps[key] = ExtendedDep{
+				Display: ver,
+				Lookup:  ver,
+				Parent:  "direct",
+			}
 		}
 
 		visited := make(map[string]introducerSet)
 		var queue []queueItem
 		var rootNodes []*DependencyNode
 
-		// Initialize BFS with direct
+		// initialize BFS with direct
 		for ga, ver := range sec.DirectDeps {
 			key := ga + "@" + ver
 			directName := ga
@@ -534,12 +557,13 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 			visited[key] = ds
 
 			node := &DependencyNode{
-				Name:   ga,
+				Name:    ga,
 				Version: ver,
-				Parent: "direct",
-				Direct: directName,
+				Parent:  "direct",
+				Direct:  directName,
 			}
 			rootNodes = append(rootNodes, node)
+
 			queue = append(queue, queueItem{
 				GroupArtifact: ga,
 				Version:       ver,
@@ -572,7 +596,6 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 				it.ParentNode.Copyleft = isCopyleftChecker(lic)
 				it.ParentNode.UsedPOMURL = usedURL
 			}
-			// BFS children
 			for _, d := range pom.Dependencies {
 				if skipScope(d.Scope, d.Optional) {
 					continue
@@ -616,7 +639,7 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 			}
 		}
 
-		// Mark introducedBy
+		// introducedBy
 		for _, root := range rootNodes {
 			setIntroducedBy(root, root.Name, allDeps)
 		}
@@ -640,14 +663,13 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 			}
 		}
 		sec.IndirectCount = sec.TransitiveCount - sec.DirectCount
-		sec.CopyleftCount = 0
 		for _, root := range rootNodes {
 			countCopyleftInTree(root, sec)
 		}
 	}
 }
 
-// setIntroducedBy ensures BFS children have the correct IntroducedBy in AllDeps.
+// BFS helper
 func setIntroducedBy(node *DependencyNode, rootName string, all map[string]ExtendedDep) {
 	for _, child := range node.Transitive {
 		key := child.Name + "@" + child.Version
@@ -672,86 +694,8 @@ func countCopyleftInTree(node *DependencyNode, sec *ReportSection) {
 }
 
 // ----------------------------------------------------------------------
-// 8) Node/Python => BFS "Maven-Style" Conversion
+// 9) NODE BFS + PYTHON BFS CODE
 // ----------------------------------------------------------------------
-
-func fallbackNpmLicenseMultiLine(pkgName string) string {
-	url := "https://www.npmjs.com/package/" + pkgName
-	resp, err := http.Get(url)
-	if err != nil || resp.StatusCode != 200 {
-		return ""
-	}
-	defer resp.Body.Close()
-
-	var lines []string
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		lines = append(lines, scanner.Text())
-	}
-	if scanner.Err() != nil {
-		return ""
-	}
-	for i := 0; i < len(lines); i++ {
-		if strings.Contains(strings.ToLower(lines[i]), "license") {
-			lic := parseLicenseLine(lines[i])
-			if lic != "" {
-				return lic
-			}
-			for j := i + 1; j < len(lines) && j <= i+10; j++ {
-				lic2 := parseLicenseLine(lines[j])
-				if lic2 != "" {
-					return lic2
-				}
-			}
-		}
-	}
-	return ""
-}
-
-func parseLicenseLine(line string) string {
-	known := []string{
-		"MIT", "ISC", "BSD", "APACHE", "ARTISTIC", "ZLIB", "WTFPL", "CDDL", "UNLICENSE", "EUPL",
-		"MPL", "CC0", "LGPL", "AGPL", "BSD-2-CLAUSE", "BSD-3-CLAUSE", "X11",
-	}
-	up := strings.ToUpper(line)
-	for _, kw := range known {
-		if strings.Contains(up, kw) {
-			return kw
-		}
-	}
-	return ""
-}
-
-func removeCaretTilde(ver string) string {
-	ver = strings.TrimSpace(ver)
-	return strings.TrimLeft(ver, "^~")
-}
-
-// Node BFS
-func parseNodeDependencies(nodeFile string) ([]*NodeDependency, error) {
-	raw, err := os.ReadFile(nodeFile)
-	if err != nil {
-		return nil, err
-	}
-	var pkg map[string]interface{}
-	if e := json.Unmarshal(raw, &pkg); e != nil {
-		return nil, e
-	}
-	deps, _ := pkg["dependencies"].(map[string]interface{})
-	if deps == nil {
-		return nil, fmt.Errorf("no dependencies found in package.json")
-	}
-	visited := make(map[string]bool)
-	var results []*NodeDependency
-	for nm, ver := range deps {
-		vstr, _ := ver.(string)
-		nd, e := resolveNodeDependency(nm, removeCaretTilde(vstr), visited)
-		if e == nil && nd != nil {
-			results = append(results, nd)
-		}
-	}
-	return results, nil
-}
 
 func findNpmLicense(verData map[string]interface{}) string {
 	if l, ok := verData["license"].(string); ok && l != "" {
@@ -778,80 +722,7 @@ func findNpmLicense(verData map[string]interface{}) string {
 	return "Unknown"
 }
 
-func resolveNodeDependency(pkgName, version string, visited map[string]bool) (*NodeDependency, error) {
-	key := pkgName + "@" + version
-	if visited[key] {
-		return nil, nil
-	}
-	visited[key] = true
-
-	url := "https://registry.npmjs.org/" + pkgName
-	resp, err := http.Get(url)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-
-	var data map[string]interface{}
-	if e := json.NewDecoder(resp.Body).Decode(&data); e != nil {
-		return nil, e
-	}
-	if version == "" {
-		if dist, ok := data["dist-tags"].(map[string]interface{}); ok {
-			if lat, ok := dist["latest"].(string); ok {
-				version = lat
-			}
-		}
-	}
-	vs, _ := data["versions"].(map[string]interface{})
-	if vs == nil {
-		return nil, nil
-	}
-	verData, ok := vs[version].(map[string]interface{})
-	if !ok {
-		if dist, ok2 := data["dist-tags"].(map[string]interface{}); ok2 {
-			if lat, ok2 := dist["latest"].(string); ok2 {
-				if vMap, ok3 := vs[lat].(map[string]interface{}); ok3 {
-					log.Printf("Node fallback: Could not find exact version %s for %s, using 'latest' => %s",
-						version, pkgName, lat)
-					version = lat
-					verData = vMap
-					ok = true
-				}
-			}
-		}
-	}
-	license := "Unknown"
-	var trans []*NodeDependency
-
-	if ok && verData != nil {
-		license = findNpmLicense(verData)
-		if deps, ok2 := verData["dependencies"].(map[string]interface{}); ok2 {
-			for subName, subVer := range deps {
-				sv, _ := subVer.(string)
-				ch, e2 := resolveNodeDependency(subName, removeCaretTilde(sv), visited)
-				if e2 == nil && ch != nil {
-					trans = append(trans, ch)
-				}
-			}
-		}
-	}
-	if license == "Unknown" {
-		if fb := fallbackNpmLicenseMultiLine(pkgName); fb != "" {
-			license = fb
-		}
-	}
-	nd := &NodeDependency{
-		Name:       pkgName,
-		Version:    version,
-		License:    license,
-		Details:    "https://www.npmjs.com/package/" + pkgName,
-		Copyleft:   isCopyleftChecker(license),
-		Transitive: trans,
-		Language:   "node",
-	}
-	return nd, nil
-}
+// Node BFS logic is done in parseNodeDependencies & resolveNodeDependency
 
 // Python BFS
 type requirement struct {
@@ -1013,201 +884,78 @@ func resolvePythonDependency(pkgName, version string, visited map[string]bool) (
 }
 
 // ----------------------------------------------------------------------
-// 9) CONVERT Node/Python => BFS "Maven-Style" in separate sections
+// 10) CONVERT Node/Python BFS => "Maven-Style" BFS
 // ----------------------------------------------------------------------
+// We do that in separate functions: convertNodeDepsToReportSection, convertPythonDepsToReportSection
+// (already defined above)
 
-func convertNodeDepsToReportSection(filePath string, nodeDeps []*NodeDependency) ReportSection {
-	directDeps := make(map[string]string)
-	allDeps := make(map[string]ExtendedDep)
-	var rootNodes []*DependencyNode
+// ----------------------------------------------------------------------
+// 11) FLATTEN BFS => TABLE ROWS
+// ----------------------------------------------------------------------
+//
+// We define a function flattenDependencyTree that does a DFS or BFS
+// to gather all nodes in a slice. Then we transform them into FlattenedDep rows.
 
-	// each top-level => BFS root
-	for _, nd := range nodeDeps {
-		key := nd.Name + "@" + nd.Version
-		directDeps[nd.Name] = nd.Version
-		allDeps[key] = ExtendedDep{Display: nd.Version, Lookup: nd.Version, Parent: "direct"}
-
-		root := convertOneNodeDep(nd, "", "")
-		rootNodes = append(rootNodes, root)
+func flattenAllTrees(sec *ReportSection) {
+	var rows []FlattenedDep
+	for _, root := range sec.DependencyTree {
+		rows = flattenOneTree(root, rows)
 	}
-
-	for _, root := range rootNodes {
-		setIntroducedByNode(root, root.Name, allDeps)
-	}
-
-	sec := ReportSection{
-		FilePath:   filePath,
-		DirectDeps: directDeps,
-		AllDeps:    allDeps,
-	}
-	sec.DependencyTree = rootNodes
-	sec.DirectCount = len(directDeps)
-
-	for k := range allDeps {
-		if strings.Contains(k, "@") {
-			parts := strings.Split(k, "@")
-			if len(parts) == 2 {
-				if parts[1] == "unknown" {
-					sec.UnknownCount++
-				} else {
-					sec.TransitiveCount++
-				}
-			}
-		}
-	}
-	sec.IndirectCount = sec.TransitiveCount - sec.DirectCount
-
-	for _, root := range rootNodes {
-		countCopyleftInTree(root, &sec)
-	}
-
-	return sec
+	sec.Flattened = rows
 }
 
-func convertOneNodeDep(nd *NodeDependency, parentGA, directName string) *DependencyNode {
-	myParent := "direct"
-	myDirect := nd.Name
-	if parentGA != "" {
-		myParent = parentGA
-		myDirect = directName
-	}
-	node := &DependencyNode{
-		Name:       nd.Name,
-		Version:    nd.Version,
-		License:    nd.License,
-		Copyleft:   nd.Copyleft,
-		Parent:     myParent,
-		Direct:     myDirect,
-		UsedPOMURL: nd.Details,
-	}
-	for _, child := range nd.Transitive {
-		cn := convertOneNodeDep(child, nd.Name+"@"+nd.Version, nd.Name)
-		node.Transitive = append(node.Transitive, cn)
-	}
-	return node
-}
+// flattenOneTree is a DFS that accumulates each node in a FlattenedDep row
+func flattenOneTree(node *DependencyNode, rows []FlattenedDep) []FlattenedDep {
+	// The “Dependency” is node.Name
+	// “Version” is node.Version
+	// “Parent” is node.Parent
+	// “TopLevel” is node.Direct
+	// “License” is node.License
+	// “Project Details” is (maybe) node.UsedPOMURL if it’s Node/Python
+	// “POM File” is node.UsedPOMURL if it’s Maven
+	// We can just put the same link in “Details” and “PomURL” or separate them if we want.
+	// For simplicity, let's do “Project Details” = node.UsedPOMURL, “POM File” also = node.UsedPOMURL if you want.
 
-func setIntroducedByNode(node *DependencyNode, rootName string, all map[string]ExtendedDep) {
-	key := node.Name + "@" + node.Version
-	inf := all[key]
-	if inf.IntroducedBy == "" {
-		inf.IntroducedBy = rootName
-	} else if !strings.Contains(inf.IntroducedBy, rootName) {
-		inf.IntroducedBy += ", " + rootName
+	row := FlattenedDep{
+		Dependency: node.Name,
+		Version:    node.Version,
+		Parent:     node.Parent,
+		TopLevel:   node.Direct,
+		License:    node.License,
+		Details:    node.UsedPOMURL,
+		PomURL:     node.UsedPOMURL,
+		Copyleft:   node.Copyleft,
 	}
-	all[key] = inf
-	for _, ch := range node.Transitive {
-		setIntroducedByNode(ch, rootName, all)
-	}
-}
+	rows = append(rows, row)
 
-// Python
-func convertPythonDepsToReportSection(filePath string, pyDeps []*PythonDependency) ReportSection {
-	directDeps := make(map[string]string)
-	allDeps := make(map[string]ExtendedDep)
-	var rootNodes []*DependencyNode
-
-	for _, pd := range pyDeps {
-		key := pd.Name + "@" + pd.Version
-		directDeps[pd.Name] = pd.Version
-		allDeps[key] = ExtendedDep{Display: pd.Version, Lookup: pd.Version, Parent: "direct"}
-
-		root := convertOnePyDep(pd, "", "")
-		rootNodes = append(rootNodes, root)
+	// Recurse for transitive
+	for _, child := range node.Transitive {
+		rows = flattenOneTree(child, rows)
 	}
-
-	for _, root := range rootNodes {
-		setIntroducedByPy(root, root.Name, allDeps)
-	}
-
-	sec := ReportSection{
-		FilePath:   filePath,
-		DirectDeps: directDeps,
-		AllDeps:    allDeps,
-	}
-	sec.DependencyTree = rootNodes
-	sec.DirectCount = len(directDeps)
-
-	for k := range allDeps {
-		if strings.Contains(k, "@") {
-			parts := strings.Split(k, "@")
-			if len(parts) == 2 {
-				if parts[1] == "unknown" {
-					sec.UnknownCount++
-				} else {
-					sec.TransitiveCount++
-				}
-			}
-		}
-	}
-	sec.IndirectCount = sec.TransitiveCount - sec.DirectCount
-
-	for _, root := range rootNodes {
-		countCopyleftInTree(root, &sec)
-	}
-	return sec
-}
-
-func convertOnePyDep(pd *PythonDependency, parentGA, directName string) *DependencyNode {
-	myParent := "direct"
-	myDirect := pd.Name
-	if parentGA != "" {
-		myParent = parentGA
-		myDirect = directName
-	}
-	node := &DependencyNode{
-		Name:       pd.Name,
-		Version:    pd.Version,
-		License:    pd.License,
-		Copyleft:   pd.Copyleft,
-		Parent:     myParent,
-		Direct:     myDirect,
-		UsedPOMURL: pd.Details,
-	}
-	for _, ch := range pd.Transitive {
-		child := convertOnePyDep(ch, pd.Name+"@"+pd.Version, pd.Name)
-		node.Transitive = append(node.Transitive, child)
-	}
-	return node
-}
-
-func setIntroducedByPy(node *DependencyNode, rootName string, all map[string]ExtendedDep) {
-	key := node.Name + "@" + node.Version
-	inf := all[key]
-	if inf.IntroducedBy == "" {
-		inf.IntroducedBy = rootName
-	} else if !strings.Contains(inf.IntroducedBy, rootName) {
-		inf.IntroducedBy += ", " + rootName
-	}
-	all[key] = inf
-	for _, ch := range node.Transitive {
-		setIntroducedByPy(ch, rootName, all)
-	}
+	return rows
 }
 
 // ----------------------------------------------------------------------
-// 10) FINAL HTML TEMPLATE
+// 12) FINAL HTML TEMPLATE (TABLE-BASED)
 // ----------------------------------------------------------------------
 
-var mergedReportTmpl = `
+var finalTableTmpl = `
 <!DOCTYPE html>
 <html>
 <head>
-    <meta charset="utf-8">
-    <title>Combined Dependency Report</title>
-    <style>
-    body { font-family: Arial, sans-serif; }
-    h1 { margin-top: 0; }
-    h2 { margin-top: 1em; }
-    ul { list-style-type: disc; margin-left: 2em; }
-    li { margin-bottom: 0.5em; }
-    .copyleft { background-color: #ffe6e6; }
-    .unknown { background-color: #ffffcc; }
-    </style>
+  <meta charset="utf-8">
+  <title>Dependency Table Report</title>
+  <style>
+  body { font-family: Arial, sans-serif; }
+  table { border-collapse: collapse; width: 95%; margin: 1em 0; }
+  th, td { border: 1px solid #ccc; padding: 6px 8px; }
+  th { background: #f7f7f7; }
+  .copyleft { background-color: #ffe6e6; }
+  .unknown { background-color: #ffffcc; }
+  </style>
 </head>
 <body>
-
-<h1>Combined Dependency Report</h1>
+<h1>Dependency Table Report</h1>
 
 {{range .Sections}}
 <h2>{{.FilePath}}</h2>
@@ -1218,33 +966,34 @@ var mergedReportTmpl = `
   Copyleft: {{.CopyleftCount}}<br/>
   Unknown Version: {{.UnknownCount}}
 </p>
-<ul>
-  {{range .DependencyTree}}
-  <li>
-    <strong>{{.Name}}@{{.Version}}</strong>
-    {{if eq .Parent "direct"}}(direct){{else}}(introduced by {{.Parent}}){{end}}
-    <br/>
-    License: <span {{if .Copyleft}}class="copyleft"{{else if eq .License "Unknown"}}class="unknown"{{end}}>{{.License}}</span>
-    {{if .UsedPOMURL}} [<a href="{{.UsedPOMURL}}" target="_blank">Link</a>]{{end}}
-    {{template "bfsTree" .Transitive}}
-  </li>
-  {{end}}
-</ul>
-<hr/>
-{{end}}
 
-{{define "bfsTree"}}
-<ul>
-  {{range .}}
-  <li>
-    <strong>{{.Name}}@{{.Version}}</strong>
-    <br/>
-    License: <span {{if .Copyleft}}class="copyleft"{{else if eq .License "Unknown"}}class="unknown"{{end}}>{{.License}}</span>
-    {{if .UsedPOMURL}} [<a href="{{.UsedPOMURL}}" target="_blank">Link</a>]{{end}}
-    {{template "bfsTree" .Transitive}}
-  </li>
+<table>
+  <tr>
+    <th>Dependency</th>
+    <th>Version</th>
+    <th>Parent</th>
+    <th>Top-Level</th>
+    <th>License</th>
+    <th>Project Details</th>
+    <th>POM File</th>
+  </tr>
+  {{range .Flattened}}
+  <tr>
+    <td>{{.Dependency}}</td>
+    <td>{{.Version}}</td>
+    <td>{{.Parent}}</td>
+    <td>{{.TopLevel}}</td>
+    <td {{if .Copyleft}}class="copyleft"{{else if eq .License "Unknown"}}class="unknown"{{end}}>{{.License}}</td>
+    <td>
+      {{if .Details}}<a href="{{.Details}}" target="_blank">Link</a>{{end}}
+    </td>
+    <td>
+      {{if .PomURL}}<a href="{{.PomURL}}" target="_blank">POM</a>{{end}}
+    </td>
+  </tr>
   {{end}}
-</ul>
+</table>
+<hr/>
 {{end}}
 
 </body>
@@ -1252,11 +1001,11 @@ var mergedReportTmpl = `
 `
 
 // ----------------------------------------------------------------------
-// 11) MAIN
+// 13) MAIN: parse everything, BFS, then flatten => table
 // ----------------------------------------------------------------------
 
 func main() {
-	// Start BFS workers for Maven
+	// Start Maven BFS workers
 	for i := 0; i < pomWorkerCount; i++ {
 		wgWorkers.Add(1)
 		go pomFetchWorker()
@@ -1315,10 +1064,10 @@ func main() {
 		sections = append(sections, rs)
 	}
 
-	// BFS expansions for Java/TOML/Gradle
+	// BFS expansions (Maven style)
 	buildTransitiveClosureJavaLike(sections)
 
-	// 2) Node => parse => convert => BFS section
+	// 2) Node => parse => BFS => section
 	nodeFile := findFile(rootDir, "package.json")
 	if nodeFile != "" {
 		nodeDeps, err := parseNodeDependencies(nodeFile)
@@ -1330,7 +1079,7 @@ func main() {
 		}
 	}
 
-	// 3) Python => parse => BFS section
+	// 3) Python => parse => BFS => section
 	pyFile := findFile(rootDir, "requirements.txt")
 	if pyFile != "" {
 		pyDeps, err := parsePythonDependencies(pyFile)
@@ -1346,7 +1095,12 @@ func main() {
 	close(pomRequests)
 	wgWorkers.Wait()
 
-	// 4) Render single HTML
+	// 4) Flatten each BFS => table rows
+	for i := range sections {
+		flattenAllTrees(&sections[i])
+	}
+
+	// 5) Render single HTML
 	type finalData struct {
 		Sections []ReportSection
 	}
@@ -1358,13 +1112,13 @@ func main() {
 	}
 	defer f.Close()
 
-	tmpl, err := template.New("report").Parse(mergedReportTmpl)
+	tmpl, err := template.New("table").Parse(finalTableTmpl)
 	if err != nil {
-		log.Fatalf("Error parsing template: %v", err)
+		log.Fatalf("Error parsing table template: %v", err)
 	}
 	if err := tmpl.Execute(f, fd); err != nil {
 		log.Fatalf("Error executing template: %v", err)
 	}
 
-	fmt.Println("Combined BFS dependency report generated:", outputReportFinal)
+	fmt.Println("Dependency table report generated:", outputReportFinal)
 }
