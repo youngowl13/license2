@@ -29,11 +29,17 @@ const (
 )
 
 var (
+	// For Maven concurrency caching
 	pomRequests  = make(chan fetchRequest, 50)
 	wgWorkers    sync.WaitGroup
 	pomCache     sync.Map // key: "group:artifact:version" -> *MavenPOM
 	channelOpen  = true
 	channelMutex sync.Mutex
+
+	// For Node BFS caching
+	nodeCache   sync.Map // key: "package@version" -> *DependencyNode
+	// For Python BFS caching
+	pythonCache sync.Map // key: "package@version" -> *DependencyNode
 )
 
 // ----------------------------------------------------------------------
@@ -661,9 +667,14 @@ func countCopyleftInTree(node *DependencyNode, sec *ReportSection) {
 }
 
 // ----------------------------------------------------------------------
-// 10) NODE & PYTHON BFS
+// 10) NODE & PYTHON BFS with Caching
 // ----------------------------------------------------------------------
 
+type requirement struct {
+	name, version string
+}
+
+// Node BFS with caching in nodeCache
 func parseNodeDependencies(nodeFile string) ([]*DependencyNode, error) {
 	data, err := os.ReadFile(nodeFile)
 	if err != nil {
@@ -696,6 +707,11 @@ func resolveNodeDependency(pkgName, version string, visited map[string]bool) (*D
 	}
 	visited[key] = true
 
+	// Check nodeCache
+	if val, ok := nodeCache.Load(key); ok {
+		return val.(*DependencyNode), nil
+	}
+
 	url := "https://registry.npmjs.org/" + pkgName
 	resp, err := http.Get(url)
 	if err != nil {
@@ -707,7 +723,6 @@ func resolveNodeDependency(pkgName, version string, visited map[string]bool) (*D
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return nil, err
 	}
-
 	if version == "" {
 		if dist, ok := data["dist-tags"].(map[string]interface{}); ok {
 			if lat, ok := dist["latest"].(string); ok {
@@ -755,6 +770,7 @@ func resolveNodeDependency(pkgName, version string, visited map[string]bool) (*D
 		Transitive: trans,
 		Direct:     pkgName,
 	}
+	nodeCache.Store(key, nd)
 	return nd, nil
 }
 
@@ -783,6 +799,7 @@ func findNpmLicense(verData map[string]interface{}) string {
 	return "Unknown"
 }
 
+// Python BFS with caching in pythonCache
 func parsePythonDependencies(reqFile string) ([]*DependencyNode, error) {
 	data, err := os.ReadFile(reqFile)
 	if err != nil {
@@ -818,26 +835,17 @@ func parsePythonDependencies(reqFile string) ([]*DependencyNode, error) {
 	return results, nil
 }
 
-func parsePyRequiresDistLine(line string) (string, string) {
-	parts := strings.FieldsFunc(line, func(r rune) bool {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
-			return false
-		}
-		return true
-	})
-	if len(parts) > 0 {
-		return strings.TrimSpace(parts[0]), ""
-	}
-	return "", ""
-}
-
 func resolvePythonDependency(pkgName, version string, visited map[string]bool) (*DependencyNode, error) {
 	key := strings.ToLower(pkgName) + "@" + version
 	if visited[key] {
 		return nil, nil
 	}
 	visited[key] = true
+
+	// Check pythonCache
+	if val, ok := pythonCache.Load(key); ok {
+		return val.(*DependencyNode), nil
+	}
 
 	url := "https://pypi.org/pypi/" + pkgName + "/json"
 	resp, err := http.Get(url)
@@ -855,7 +863,7 @@ func resolvePythonDependency(pkgName, version string, visited map[string]bool) (
 	}
 	info, ok := data["info"].(map[string]interface{})
 	if !ok {
-		return nil, fmt.Errorf("info missing for %s", pkgName)
+		return nil, fmt.Errorf("info section missing for %s", pkgName)
 	}
 	if version == "" {
 		if v, ok := info["version"].(string); ok {
@@ -897,6 +905,7 @@ func resolvePythonDependency(pkgName, version string, visited map[string]bool) (
 		Transitive: trans,
 		Direct:     pkgName,
 	}
+	pythonCache.Store(key, nd)
 	return nd, nil
 }
 
@@ -935,6 +944,7 @@ func flattenBFS(sec *ReportSection) {
 		walk(root)
 	}
 
+	// Copyleft first, unknown second, known last
 	sec.Flattened = append(sec.Flattened, copyleftRows...)
 	sec.Flattened = append(sec.Flattened, unknownRows...)
 	sec.Flattened = append(sec.Flattened, knownRows...)
@@ -1024,11 +1034,10 @@ var finalHTML = `
     {{end}}
   </table>
 
-  <!-- BFS TREE => color-coded li, labeled "POM File Link" -->
+  <!-- BFS TREE => color-coded li, labeled "POM File Link" (or Node/Python link) -->
   <h3>Dependency Tree</h3>
   <ul class="tree">
     {{range $i, $root := .DependencyTree}}
-    {{- /* color-coded <li> based on copyleft/unknown/known */ -}}
     <li class="{{if $root.Copyleft}}copyleft{{else if eq $root.License "Unknown"}}unknown{{else}}known{{end}}">
       <span class="toggle-btn" onclick="toggleSubtree('node-{{$fp}}-{{$i}}', this)">▶</span>
       <strong>{{$root.Name}}@{{$root.Version}}</strong>
@@ -1086,7 +1095,7 @@ func main() {
 
 	var sections []ReportSection
 
-	// 1) Find & parse Maven
+	// 1) Maven
 	pomFiles, err := findAllPOMFiles(rootDir)
 	if err != nil {
 		log.Println("Error finding pom.xml files:", err)
@@ -1105,7 +1114,7 @@ func main() {
 		sections = append(sections, rs)
 	}
 
-	// 2) Find & parse TOML
+	// 2) TOML
 	tomlFiles, err := findAllTOMLFiles(rootDir)
 	if err != nil {
 		log.Println("Error finding .toml files:", err)
@@ -1124,7 +1133,7 @@ func main() {
 		sections = append(sections, rs)
 	}
 
-	// 3) Find & parse Gradle
+	// 3) Gradle
 	gradleFiles, err := findAllGradleFiles(rootDir)
 	if err != nil {
 		log.Println("Error finding Gradle files:", err)
@@ -1194,7 +1203,7 @@ func main() {
 		}
 	}
 
-	// Close BFS
+	// Close BFS channel
 	close(pomRequests)
 	wgWorkers.Wait()
 
@@ -1208,7 +1217,6 @@ func main() {
 	}
 	fd := finalData{Sections: sections}
 
-	// Register "dict" in the template function map
 	funcMap := template.FuncMap{
 		"dict": dict,
 	}
@@ -1228,7 +1236,7 @@ func main() {
 		log.Fatalf("Error executing template: %v", err)
 	}
 
-	fmt.Println("Colored table + BFS (copyleft=red, unknown=yellow, known=green) =>", outputReportFinal)
+	fmt.Println("Colored table + BFS with caching =>", outputReportFinal)
 }
 
 // ----------------------------------------------------------------------
