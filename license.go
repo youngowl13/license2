@@ -1,4 +1,3 @@
-// File: license_compliance_report.go
 package main
 
 import (
@@ -22,17 +21,16 @@ import (
 )
 
 // ----------------------------------------------------------------------
-// GLOBAL CONFIG AND SHARED STATE
+// 1) GLOBAL CONFIG & TYPES
 // ----------------------------------------------------------------------
 
 const (
-	localPOMCacheDir  = ".pom-cache"
-	pomWorkerCount    = 10
-	fetchTimeout      = 30 * time.Second
-	finalHTMLFilename = "license_compliance_report.html"
+	localPOMCacheDir       = ".pom-cache"
+	pomWorkerCount         = 10
+	fetchTimeout           = 30 * time.Second
+	outputReportFinal      = "license_compliance_report.html"
 )
 
-// For concurrency in Maven BFS:
 var (
 	pomRequests  = make(chan fetchRequest, 50)
 	wgWorkers    sync.WaitGroup
@@ -41,10 +39,7 @@ var (
 	channelMutex sync.Mutex
 )
 
-// ----------------------------------------------------------------------
-// TYPES FROM THE MAVEN LICENSE CHECKER (license(1).go)
-// ----------------------------------------------------------------------
-
+// BFS concurrency
 type fetchRequest struct {
 	GroupID    string
 	ArtifactID string
@@ -57,6 +52,10 @@ type fetchResult struct {
 	UsedURL string
 	Err     error
 }
+
+// ----------------------------------------------------------------------
+// 2) MAVEN LICENSE CHECKER STRUCTS (from license(1).go)
+// ----------------------------------------------------------------------
 
 type License struct {
 	Name string `xml:"name"`
@@ -85,19 +84,19 @@ type MavenPOM struct {
 	} `xml:"parent"`
 }
 
-// A single node in the BFS tree for Java/TOML/Gradle
+// For the BFS tree of Java/TOML/Gradle
 type DependencyNode struct {
 	Name       string
 	Version    string
 	License    string
 	Copyleft   bool
-	Parent     string
+	Parent     string // "direct" or e.g. "group/artifact@version"
 	Transitive []*DependencyNode
 	UsedPOMURL string
 	Direct     string
 }
 
-// ExtendedDep is used in the map form
+// ExtendedDep used for flattened info
 type ExtendedDep struct {
 	Display      string
 	Lookup       string
@@ -107,7 +106,7 @@ type ExtendedDep struct {
 	PomURL       string
 }
 
-// For each discovered file (pom.xml, .toml, build.gradle), we store its BFS results here.
+// One section per discovered file (pom.xml, .toml, build.gradle)
 type ReportSection struct {
 	FilePath        string
 	DirectDeps      map[string]string
@@ -121,7 +120,7 @@ type ReportSection struct {
 }
 
 // ----------------------------------------------------------------------
-// MAVEN/TOML/GRADLE DISCOVERY & PARSING (from license(1).go)
+// 3) FILE DISCOVERY & PARSING (Maven, TOML, Gradle)
 // ----------------------------------------------------------------------
 
 func findAllPOMFiles(root string) ([]string, error) {
@@ -323,7 +322,7 @@ func parseVersionRange(v string) string {
 }
 
 // ----------------------------------------------------------------------
-// MAVEN BFS & REMOTE FETCH LOGIC
+// 4) MAVEN BFS & REMOTE FETCH
 // ----------------------------------------------------------------------
 
 func skipScope(scope, optional string) bool {
@@ -433,7 +432,7 @@ func pomFetchWorker() {
 }
 
 // ----------------------------------------------------------------------
-// BUILD TRANSITIVE CLOSURE FOR MAVEN/TOML/GRADLE
+// 5) BFS FOR MAVEN/TOML/GRADLE
 // ----------------------------------------------------------------------
 
 type queueItem struct {
@@ -444,6 +443,7 @@ type queueItem struct {
 	Direct        string
 }
 
+// We do a BFS for each discovered file (POM, TOML, Gradle).
 func buildTransitiveClosure(sections []ReportSection) {
 	for i := range sections {
 		sec := &sections[i]
@@ -464,13 +464,14 @@ func buildTransitiveClosure(sections []ReportSection) {
 		var queue []queueItem
 		var rootNodes []*DependencyNode
 
-		// Initialize BFS with direct deps
+		// Initialize BFS with direct
 		for ga, ver := range sec.DirectDeps {
 			key := ga + "@" + ver
 			directName := ga
 			ds := make(introducerSet)
 			ds[directName] = true
 			visited[key] = ds
+
 			node := &DependencyNode{
 				Name:    ga,
 				Version: ver,
@@ -478,6 +479,7 @@ func buildTransitiveClosure(sections []ReportSection) {
 				Direct:  directName,
 			}
 			rootNodes = append(rootNodes, node)
+
 			queue = append(queue, queueItem{
 				GroupArtifact: ga,
 				Version:       ver,
@@ -501,6 +503,7 @@ func buildTransitiveClosure(sections []ReportSection) {
 			if strings.ToLower(it.Version) == "unknown" {
 				continue
 			}
+
 			pom, usedURL, err := concurrentFetchPOM(group, artifact, it.Version)
 			if err != nil || pom == nil {
 				continue
@@ -552,18 +555,18 @@ func buildTransitiveClosure(sections []ReportSection) {
 			}
 		}
 
-		// Mark introducedBy
+		// The BFS populates rootNodes. We now do introducedBy for transitive.
 		for _, node := range rootNodes {
 			setIntroducedBy(node, node.Name, allDeps)
 		}
 
-		// Flatten BFS data back to sec.AllDeps
+		// Flatten BFS data into sec.AllDeps
 		for k, v := range allDeps {
 			sec.AllDeps[k] = v
 		}
 		sec.DependencyTree = rootNodes
 
-		// Count stats
+		// Stats
 		sec.DirectCount = len(sec.DirectDeps)
 		sec.TransitiveCount = 0
 		sec.IndirectCount = 0
@@ -583,9 +586,25 @@ func buildTransitiveClosure(sections []ReportSection) {
 			}
 		}
 		sec.IndirectCount = sec.TransitiveCount - sec.DirectCount
+
 		for _, root := range sec.DependencyTree {
 			countCopyleftInTree(root, sec)
 		}
+	}
+}
+
+// This function ensures each transitive node is assigned the correct IntroducedBy string in the AllDeps map.
+func setIntroducedBy(node *DependencyNode, rootName string, all map[string]ExtendedDep) {
+	for _, child := range node.Transitive {
+		key := child.Name + "@" + child.Version
+		inf := all[key]
+		if inf.IntroducedBy == "" {
+			inf.IntroducedBy = rootName
+		} else if !strings.Contains(inf.IntroducedBy, rootName) {
+			inf.IntroducedBy += ", " + rootName
+		}
+		all[key] = inf
+		setIntroducedBy(child, rootName, all)
 	}
 }
 
@@ -622,19 +641,8 @@ func countCopyleftInTree(node *DependencyNode, sec *ReportSection) {
 }
 
 // ----------------------------------------------------------------------
-// NODE/PYTHON CODE (from checker.go) - BFS expansions
+// 6) NODE & PYTHON BFS CODE (from checker.go)
 // ----------------------------------------------------------------------
-
-// NodeDependency is already BFS-like: we have a Transitive slice.
-type NodeDependency struct {
-	Name       string
-	Version    string
-	License    string
-	Details    string
-	Copyleft   bool
-	Transitive []*NodeDependency
-	Language   string
-}
 
 func findFile(root, target string) string {
 	var found string
@@ -667,7 +675,17 @@ func removeCaretTilde(ver string) string {
 	return strings.TrimLeft(ver, "^~")
 }
 
-// Fallback approach to scrape the npm package page if needed:
+// Node BFS
+type NodeDependency struct {
+	Name       string
+	Version    string
+	License    string
+	Details    string
+	Copyleft   bool
+	Transitive []*NodeDependency
+	Language   string
+}
+
 func fallbackNpmLicenseMultiLine(pkgName string) string {
 	url := "https://www.npmjs.com/package/" + pkgName
 	resp, err := http.Get(url)
@@ -726,7 +744,6 @@ func findNpmLicense(verData map[string]interface{}) string {
 	return "Unknown"
 }
 
-// parseNodeDependencies does BFS by calling resolveNodeDependency, which recursively sets .Transitive
 func parseNodeDependencies(nodeFile string) ([]*NodeDependency, error) {
 	raw, err := os.ReadFile(nodeFile)
 	if err != nil {
@@ -770,7 +787,7 @@ func resolveNodeDependency(pkgName, version string, visited map[string]bool) (*N
 	if e := json.NewDecoder(resp.Body).Decode(&data); e != nil {
 		return nil, e
 	}
-	// If version not specified, fallback to dist-tags.latest
+	// If version is empty, fallback to dist-tags.latest
 	if version == "" {
 		if dist, ok := data["dist-tags"].(map[string]interface{}); ok {
 			if lat, ok := dist["latest"].(string); ok {
@@ -784,7 +801,6 @@ func resolveNodeDependency(pkgName, version string, visited map[string]bool) (*N
 	}
 	verData, ok := vs[version].(map[string]interface{})
 	if !ok {
-		// fallback to "latest" if exact version not found
 		if dist, ok2 := data["dist-tags"].(map[string]interface{}); ok2 {
 			if lat, ok2 := dist["latest"].(string); ok2 {
 				if vMap, ok3 := vs[lat].(map[string]interface{}); ok3 {
@@ -999,12 +1015,8 @@ func resolvePythonDependency(pkgName, version string, visited map[string]bool) (
 }
 
 // ----------------------------------------------------------------------
-// FINAL HTML TEMPLATE - COMBINED BFS REPORT
+// 7) MERGED HTML TEMPLATE
 // ----------------------------------------------------------------------
-//
-// The user wants a single HTML that looks like a "combination of both reports"
-// with BFS expansions for Java/TOML/Gradle (License Checker) and BFS expansions
-// for Node/Python (Dependency Checker), plus the headings from both codes.
 
 var mergedReportTmpl = `
 <!DOCTYPE html>
@@ -1019,7 +1031,6 @@ var mergedReportTmpl = `
     .unknown { background-color: #ffffcc; }
     ul { list-style-type: disc; margin-left: 2em; }
     li { margin-bottom: 0.5em; }
-    .indent { margin-left: 1em; }
     a { text-decoration: none; color: #337ab7; }
     a:hover { text-decoration: underline; }
     </style>
@@ -1028,7 +1039,7 @@ var mergedReportTmpl = `
 
 <h1>Combined Dependency Report</h1>
 
-<!-- 1) LICENSE CHECKER RESULTS (Maven/TOML/Gradle) -->
+<!-- 1) LICENSE CHECKER RESULTS -->
 <h2>License Checker Results</h2>
 {{range .JavaSections}}
 <h3>{{.FilePath}}</h3>
@@ -1138,11 +1149,11 @@ var mergedReportTmpl = `
 `
 
 // ----------------------------------------------------------------------
-// MAIN: Merge Everything, Produce Single HTML
+// 8) MAIN FUNCTION
 // ----------------------------------------------------------------------
 
 func main() {
-	// 1) Start workers for Maven BFS
+	// Start pom fetch workers
 	for i := 0; i < pomWorkerCount; i++ {
 		wgWorkers.Add(1)
 		go pomFetchWorker()
@@ -1150,7 +1161,7 @@ func main() {
 
 	rootDir := "."
 
-	// 2) Collect Java/TOML/Gradle sections
+	// 1) Gather Java/TOML/Gradle
 	var sections []ReportSection
 
 	pomFiles, _ := findAllPOMFiles(rootDir)
@@ -1160,12 +1171,12 @@ func main() {
 			log.Println("Error parsing pom.xml:", err)
 			continue
 		}
-		rs := ReportSection{
+		sec := ReportSection{
 			FilePath:   pf,
 			DirectDeps: deps,
 			AllDeps:    make(map[string]ExtendedDep),
 		}
-		sections = append(sections, rs)
+		sections = append(sections, sec)
 	}
 
 	tomlFiles, _ := findAllTOMLFiles(rootDir)
@@ -1175,12 +1186,12 @@ func main() {
 			log.Println("Error parsing TOML:", err)
 			continue
 		}
-		rs := ReportSection{
+		sec := ReportSection{
 			FilePath:   tf,
 			DirectDeps: deps,
 			AllDeps:    make(map[string]ExtendedDep),
 		}
-		sections = append(sections, rs)
+		sections = append(sections, sec)
 	}
 
 	gradleFiles, _ := findAllGradleFiles(rootDir)
@@ -1190,18 +1201,18 @@ func main() {
 			log.Println("Error parsing Gradle:", err)
 			continue
 		}
-		rs := ReportSection{
+		sec := ReportSection{
 			FilePath:   gf,
 			DirectDeps: deps,
 			AllDeps:    make(map[string]ExtendedDep),
 		}
-		sections = append(sections, rs)
+		sections = append(sections, sec)
 	}
 
-	// BFS for the Java/TOML/Gradle sections
+	// BFS for Java/TOML/Gradle
 	buildTransitiveClosure(sections)
 
-	// 3) Collect Node BFS
+	// 2) Gather Node BFS
 	nodeFile := findFile(rootDir, "package.json")
 	var nodeDeps []*NodeDependency
 	if nodeFile != "" {
@@ -1213,7 +1224,7 @@ func main() {
 		}
 	}
 
-	// 4) Collect Python BFS
+	// 3) Gather Python BFS
 	pyFile := findFile(rootDir, "requirements.txt")
 	var pyDeps []*PythonDependency
 	if pyFile != "" {
@@ -1225,11 +1236,11 @@ func main() {
 		}
 	}
 
-	// Done BFS => close channel, wait for workers
+	// Close BFS channel & wait
 	close(pomRequests)
 	wgWorkers.Wait()
 
-	// 5) Render single HTML with both BFS expansions
+	// 4) Render single HTML
 	type finalData struct {
 		JavaSections []ReportSection
 		NodeDeps     []*NodeDependency
@@ -1241,7 +1252,7 @@ func main() {
 		PyDeps:       pyDeps,
 	}
 
-	f, err := os.Create(finalHTMLFilename)
+	f, err := os.Create(outputReportFinal)
 	if err != nil {
 		log.Fatalf("Cannot create final HTML report: %v", err)
 	}
@@ -1256,5 +1267,5 @@ func main() {
 		log.Fatalf("Error executing merged template: %v", err)
 	}
 
-	fmt.Println("Combined BFS dependency report generated at:", finalHTMLFilename)
+	fmt.Println("License compliance report generated at:", outputReportFinal)
 }
