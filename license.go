@@ -37,7 +37,7 @@ var (
 )
 
 // ----------------------------------------------------------------------
-// 2) COMMON TYPES FOR DEPENDENCY TREES & REPORTS
+// 2) COMMON TYPES
 // ----------------------------------------------------------------------
 
 type DependencyNode struct {
@@ -45,10 +45,10 @@ type DependencyNode struct {
 	Version    string
 	License    string
 	Copyleft   bool
-	Parent     string            // "direct" or parent's coordinate
-	Transitive []*DependencyNode // child dependencies
-	UsedPOMURL string            // for Maven => POM link; Node/Python => details link
-	Direct     string            // top-level dependency that introduced this node
+	Parent     string
+	Transitive []*DependencyNode
+	UsedPOMURL string // BFS link => "POM File Link"
+	Direct     string // top-level that introduced it
 }
 
 type ExtendedDep struct {
@@ -62,7 +62,7 @@ type ExtendedDep struct {
 
 type ReportSection struct {
 	FilePath        string
-	DirectDeps      map[string]string // e.g. "group/artifact" => version
+	DirectDeps      map[string]string
 	AllDeps         map[string]ExtendedDep
 	DependencyTree  []*DependencyNode
 
@@ -72,7 +72,7 @@ type ReportSection struct {
 	CopyleftCount   int
 	UnknownCount    int
 
-	Flattened []FlattenedDep // Flattened table rows
+	Flattened []FlattenedDep
 }
 
 type FlattenedDep struct {
@@ -82,13 +82,13 @@ type FlattenedDep struct {
 	TopLevel   string
 	License    string
 	Copyleft   bool
-	Details    string
+	Details    string // "Project Details" column
 }
 
 type introducerSet map[string]bool
 
 // ----------------------------------------------------------------------
-// 3) TYPES FOR MAVEN FETCHING
+// 3) MAVEN FETCHING
 // ----------------------------------------------------------------------
 
 type fetchRequest struct {
@@ -105,7 +105,7 @@ type fetchResult struct {
 }
 
 // ----------------------------------------------------------------------
-// 4) MAVEN XML STRUCTURES & PARSING
+// 4) MAVEN XML STRUCTURES
 // ----------------------------------------------------------------------
 
 type LicenseXML struct {
@@ -136,7 +136,7 @@ type MavenPOM struct {
 }
 
 // ----------------------------------------------------------------------
-// 5) FILE FINDING FUNCTIONS
+// 5) FILE DISCOVERY
 // ----------------------------------------------------------------------
 
 func findAllPOMFiles(root string) ([]string, error) {
@@ -205,8 +205,7 @@ func splitGA(ga string) (string, string) {
 }
 
 func removeCaretTilde(ver string) string {
-	ver = strings.TrimSpace(ver)
-	return strings.TrimLeft(ver, "^~")
+	return strings.TrimLeft(strings.TrimSpace(ver), "^~")
 }
 
 func detectLicense(pom *MavenPOM) string {
@@ -245,7 +244,7 @@ func parseVersionRange(v string) string {
 }
 
 // ----------------------------------------------------------------------
-// 7) PARSING FUNCTIONS: MAVEN, TOML, GRADLE
+// 7) MAVEN/TOML/GRADLE PARSING
 // ----------------------------------------------------------------------
 
 func parseOneLocalPOMFile(filePath string) (map[string]string, error) {
@@ -391,7 +390,7 @@ func parseGradleVariables(content string) map[string]string {
 }
 
 // ----------------------------------------------------------------------
-// 8) MAVEN BFS WORKER & FETCH FUNCTIONS
+// 8) MAVEN BFS WORKER & FETCH
 // ----------------------------------------------------------------------
 
 func pomFetchWorker() {
@@ -491,7 +490,7 @@ func concurrentFetchPOM(group, artifact, version string) (*MavenPOM, string, err
 }
 
 // ----------------------------------------------------------------------
-// 9) MAVEN/TOML/GRADLE BFS (buildTransitiveClosureJavaLike)
+// 9) MAVEN/TOML/GRADLE BFS
 // ----------------------------------------------------------------------
 
 type queueItem struct {
@@ -662,12 +661,8 @@ func countCopyleftInTree(node *DependencyNode, sec *ReportSection) {
 }
 
 // ----------------------------------------------------------------------
-// 10) NODE & PYTHON BFS PARSING (FULL TRANSITIVE EXPANSION)
+// 10) NODE & PYTHON BFS
 // ----------------------------------------------------------------------
-
-type requirement struct {
-	name, version string
-}
 
 func parseNodeDependencies(nodeFile string) ([]*DependencyNode, error) {
 	data, err := os.ReadFile(nodeFile)
@@ -700,6 +695,7 @@ func resolveNodeDependency(pkgName, version string, visited map[string]bool) (*D
 		return nil, nil
 	}
 	visited[key] = true
+
 	url := "https://registry.npmjs.org/" + pkgName
 	resp, err := http.Get(url)
 	if err != nil {
@@ -725,6 +721,7 @@ func resolveNodeDependency(pkgName, version string, visited map[string]bool) (*D
 	}
 	verData, ok := vs[version].(map[string]interface{})
 	if !ok {
+		// fallback
 		if dist, ok2 := data["dist-tags"].(map[string]interface{}); ok2 {
 			if lat, ok2 := dist["latest"].(string); ok2 {
 				if vMap, ok3 := vs[lat].(map[string]interface{}); ok3 {
@@ -904,7 +901,7 @@ func resolvePythonDependency(pkgName, version string, visited map[string]bool) (
 }
 
 // ----------------------------------------------------------------------
-// 11) FLATTEN BFS TREE INTO TABLE ROWS, ORDERED BY (COPLEFT, UNKNOWN, KNOWN)
+// 11) FLATTEN BFS => TABLE ROWS (with copyleft first, unknown second, known last)
 // ----------------------------------------------------------------------
 
 func flattenBFS(sec *ReportSection) {
@@ -919,9 +916,8 @@ func flattenBFS(sec *ReportSection) {
 			TopLevel:   node.Direct,
 			License:    node.License,
 			Copyleft:   node.Copyleft,
-			Details:    node.UsedPOMURL,
+			Details:    node.UsedPOMURL, // "Project Details"
 		}
-
 		switch {
 		case node.Copyleft:
 			copyleftRows = append(copyleftRows, row)
@@ -930,7 +926,6 @@ func flattenBFS(sec *ReportSection) {
 		default:
 			knownRows = append(knownRows, row)
 		}
-
 		for _, child := range node.Transitive {
 			walk(child)
 		}
@@ -940,14 +935,13 @@ func flattenBFS(sec *ReportSection) {
 		walk(root)
 	}
 
-	// Copyleft first (red), Unknown second (yellow), Known last (green)
 	sec.Flattened = append(sec.Flattened, copyleftRows...)
 	sec.Flattened = append(sec.Flattened, unknownRows...)
 	sec.Flattened = append(sec.Flattened, knownRows...)
 }
 
 // ----------------------------------------------------------------------
-// 12) FINAL HTML TEMPLATE (TABLE FIRST, THEN COLLAPSIBLE BFS) with dict helper
+// 12) FINAL HTML TEMPLATE
 // ----------------------------------------------------------------------
 
 var finalHTML = `
@@ -963,27 +957,34 @@ var finalHTML = `
     th, td { border: 1px solid #ccc; padding: 6px 8px; }
     th { background: #f7f7f7; }
 
-    /* Color-coded row classes, with copyleft first (red), unknown second (yellow), known last (green). */
-    tr.copyleft { background-color: #ffcccc; }
-    tr.unknown { background-color: #ffffcc; }
-    tr.known { background-color: #ccffcc; }
+    /* Row-based coloring for the table */
+    tr.copyleft { background-color: #ffcccc; }  /* red */
+    tr.unknown  { background-color: #ffffcc; }  /* yellow */
+    tr.known    { background-color: #ccffcc; }  /* green */
+
+    /* BFS tree coloring => li classes */
+    li.copyleft { background-color: #ffcccc; margin-bottom: 0.3em; padding: 4px; }
+    li.unknown  { background-color: #ffffcc; margin-bottom: 0.3em; padding: 4px; }
+    li.known    { background-color: #ccffcc; margin-bottom: 0.3em; padding: 4px; }
 
     .toggle-btn { cursor: pointer; font-weight: bold; color: #007bff; margin-right: 5px; }
     .toggle-btn:hover { text-decoration: underline; }
     .hidden { display: none; }
     ul.tree { list-style-type: none; padding-left: 1em; }
-    li.tree-item { margin-bottom: 0.5em; }
   </style>
+
   <script>
-    function toggleSubtree(id) {
-      var el = document.getElementById(id);
-      if (!el) return;
-      if (el.classList.contains('hidden')) {
-        el.classList.remove('hidden');
-      } else {
-        el.classList.add('hidden');
-      }
+  function toggleSubtree(id, btn) {
+    var el = document.getElementById(id);
+    if (!el) return;
+    if (el.classList.contains('hidden')) {
+      el.classList.remove('hidden');
+      if (btn) btn.textContent = "▼";
+    } else {
+      el.classList.add('hidden');
+      if (btn) btn.textContent = "▶";
     }
+  }
   </script>
 </head>
 <body>
@@ -999,7 +1000,8 @@ var finalHTML = `
     Copyleft: {{.CopyleftCount}}<br/>
     Unknown: {{.UnknownCount}}
   </p>
-  <!-- TABLE FIRST -->
+
+  <!-- TABLE FIRST (copyleft => red, unknown => yellow, known => green) -->
   <h3>Dependency Table</h3>
   <table>
     <tr>
@@ -1021,17 +1023,20 @@ var finalHTML = `
     </tr>
     {{end}}
   </table>
-  <!-- COLLAPSIBLE BFS TREE -->
+
+  <!-- BFS TREE => color-coded li, labeled "POM File Link" -->
   <h3>Dependency Tree</h3>
   <ul class="tree">
     {{range $i, $root := .DependencyTree}}
-    <li class="tree-item">
-      <span class="toggle-btn" onclick="toggleSubtree('node-{{$fp}}-{{$i}}')">[+/-]</span>
+    {{- /* color-coded <li> based on copyleft/unknown/known */ -}}
+    <li class="{{if $root.Copyleft}}copyleft{{else if eq $root.License "Unknown"}}unknown{{else}}known{{end}}">
+      <span class="toggle-btn" onclick="toggleSubtree('node-{{$fp}}-{{$i}}', this)">▶</span>
       <strong>{{$root.Name}}@{{$root.Version}}</strong>
       {{if eq $root.Parent "direct"}}(direct){{else}}(introduced by {{$root.Parent}}){{end}}
       <br/>
-      License: <span class="{{if $root.Copyleft}}copyleft{{else if eq $root.License "Unknown"}}unknown{{else}}known{{end}}">{{$root.License}}</span>
-      {{if $root.UsedPOMURL}} [<a href="{{$root.UsedPOMURL}}" target="_blank">Link</a>]{{end}}
+      License: {{$root.License}}<br/>
+      POM File Link: {{if $root.UsedPOMURL}}<a href="{{$root.UsedPOMURL}}" target="_blank">Open</a>{{else}}(none){{end}}
+
       {{if $root.Transitive}}
       <ul class="hidden" id="node-{{$fp}}-{{$i}}">
         {{template "subTree" (dict "Nodes" $root.Transitive "File" $fp "Prefix" (print $i))}}
@@ -1044,31 +1049,34 @@ var finalHTML = `
 {{end}}
 
 {{define "subTree"}}
-  {{ $data := . }}
-  {{ range $j, $child := $data.Nodes }}
-  <li class="tree-item">
-    <span class="toggle-btn" onclick="toggleSubtree('sub-{{$data.File}}-{{$data.Prefix}}-{{$j}}')">[+/-]</span>
-    <strong>{{$child.Name}}@{{$child.Version}}</strong><br/>
-    License: <span class="{{if $child.Copyleft}}copyleft{{else if eq $child.License "Unknown"}}unknown{{else}}known{{end}}">{{$child.License}}</span>
-    {{if $child.UsedPOMURL}} [<a href="{{$child.UsedPOMURL}}" target="_blank">Link</a>]{{end}}
-    {{if $child.Transitive}}
-    <ul class="hidden" id="sub-{{$data.File}}-{{$data.Prefix}}-{{$j}}">
-      {{template "subTree" (dict "Nodes" $child.Transitive "File" $data.File "Prefix" (print $data.Prefix "-" $j))}}
-    </ul>
-    {{end}}
-  </li>
+{{- $data := . -}}
+{{range $j, $child := $data.Nodes}}
+<li class="{{if $child.Copyleft}}copyleft{{else if eq $child.License "Unknown"}}unknown{{else}}known{{end}}">
+  <span class="toggle-btn" onclick="toggleSubtree('sub-{{$data.File}}-{{$data.Prefix}}-{{$j}}', this)">▶</span>
+  <strong>{{$child.Name}}@{{$child.Version}}</strong>
+  {{if eq $child.Parent "direct"}}(direct){{else}}(introduced by {{$child.Parent}}){{end}}
+  <br/>
+  License: {{$child.License}}<br/>
+  POM File Link: {{if $child.UsedPOMURL}}<a href="{{$child.UsedPOMURL}}" target="_blank">Open</a>{{else}}(none){{end}}
+
+  {{if $child.Transitive}}
+  <ul class="hidden" id="sub-{{$data.File}}-{{$data.Prefix}}-{{$j}}">
+    {{template "subTree" (dict "Nodes" $child.Transitive "File" $data.File "Prefix" (print $data.Prefix "-" $j))}}
+  </ul>
   {{end}}
+</li>
+{{end}}
 {{end}}
 </body>
 </html>
 `
 
 // ----------------------------------------------------------------------
-// 13) MAIN FUNCTION
+// 13) MAIN
 // ----------------------------------------------------------------------
 
 func main() {
-	// Start Maven BFS workers
+	// Start BFS workers
 	for i := 0; i < pomWorkerCount; i++ {
 		wgWorkers.Add(1)
 		go pomFetchWorker()
@@ -1078,7 +1086,7 @@ func main() {
 
 	var sections []ReportSection
 
-	// 1) Maven Files
+	// 1) Find & parse Maven
 	pomFiles, err := findAllPOMFiles(rootDir)
 	if err != nil {
 		log.Println("Error finding pom.xml files:", err)
@@ -1097,7 +1105,7 @@ func main() {
 		sections = append(sections, rs)
 	}
 
-	// 2) TOML Files
+	// 2) Find & parse TOML
 	tomlFiles, err := findAllTOMLFiles(rootDir)
 	if err != nil {
 		log.Println("Error finding .toml files:", err)
@@ -1116,7 +1124,7 @@ func main() {
 		sections = append(sections, rs)
 	}
 
-	// 3) Gradle Files
+	// 3) Find & parse Gradle
 	gradleFiles, err := findAllGradleFiles(rootDir)
 	if err != nil {
 		log.Println("Error finding Gradle files:", err)
@@ -1138,12 +1146,12 @@ func main() {
 	// BFS expansions for Maven/TOML/Gradle
 	buildTransitiveClosureJavaLike(sections)
 
-	// 4) Node
+	// 4) Node BFS
 	nodeFile := findFile(rootDir, "package.json")
 	if nodeFile != "" {
 		nodeDeps, err := parseNodeDependencies(nodeFile)
 		if err != nil {
-			log.Println("Error parsing Node dependencies:", err)
+			log.Println("Error parsing Node BFS:", err)
 		} else if len(nodeDeps) > 0 {
 			direct := make(map[string]string)
 			for _, n := range nodeDeps {
@@ -1162,12 +1170,12 @@ func main() {
 		}
 	}
 
-	// 5) Python
+	// 5) Python BFS
 	pyFile := findFile(rootDir, "requirements.txt")
 	if pyFile != "" {
 		pyDeps, err := parsePythonDependencies(pyFile)
 		if err != nil {
-			log.Println("Error parsing Python dependencies:", err)
+			log.Println("Error parsing Python BFS:", err)
 		} else if len(pyDeps) > 0 {
 			direct := make(map[string]string)
 			for _, p := range pyDeps {
@@ -1186,10 +1194,11 @@ func main() {
 		}
 	}
 
+	// Close BFS
 	close(pomRequests)
 	wgWorkers.Wait()
 
-	// Flatten BFS => table, with copyleft first, unknown second, known last
+	// Flatten BFS => table
 	for i := range sections {
 		flattenBFS(&sections[i])
 	}
@@ -1199,7 +1208,7 @@ func main() {
 	}
 	fd := finalData{Sections: sections}
 
-	// Register a helper function "dict" so sub-templates can accept maps
+	// Register "dict" in the template function map
 	funcMap := template.FuncMap{
 		"dict": dict,
 	}
@@ -1219,11 +1228,11 @@ func main() {
 		log.Fatalf("Error executing template: %v", err)
 	}
 
-	fmt.Println("Colored table + collapsible BFS dependency report generated at:", outputReportFinal)
+	fmt.Println("Colored table + BFS (copyleft=red, unknown=yellow, known=green) =>", outputReportFinal)
 }
 
 // ----------------------------------------------------------------------
-// 14) UTILITY: COUNT TOTAL DEPENDENCIES
+// 14) COUNT TOTAL DEPENDENCIES
 // ----------------------------------------------------------------------
 
 func countTotalDependencies(nodes []*DependencyNode) int {
@@ -1240,7 +1249,7 @@ func countTotalDependencies(nodes []*DependencyNode) int {
 }
 
 // ----------------------------------------------------------------------
-// 15) TEMPLATE HELPER: dict (single declaration)
+// 15) TEMPLATE HELPER: dict
 // ----------------------------------------------------------------------
 
 func dict(values ...interface{}) map[string]interface{} {
