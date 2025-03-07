@@ -638,6 +638,11 @@ func countCopyleftInTree(node *DependencyNode, sec *ReportSection) {
 // 10) NODE & PYTHON BFS PARSING (FULL TRANSITIVE EXPANSION)
 // ----------------------------------------------------------------------
 
+// Define the requirement type for Python/Node parsing.
+type requirement struct {
+	name, version string
+}
+
 func parseNodeDependencies(nodeFile string) ([]*DependencyNode, error) {
 	data, err := os.ReadFile(nodeFile)
 	if err != nil {
@@ -790,8 +795,7 @@ func parsePythonDependencies(reqFile string) ([]*DependencyNode, error) {
 
 func parsePyRequiresDistLine(line string) (string, string) {
 	parts := strings.FieldsFunc(line, func(r rune) bool {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
-			(r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
 			return false
 		}
 		return true
@@ -934,6 +938,7 @@ var finalHTML = `
 </head>
 <body>
 <h1>Combined Dependency Report</h1>
+
 {{range .Sections}}
   {{$fp := .FilePath}}
   <h2>{{$fp}}</h2>
@@ -1136,7 +1141,7 @@ func main() {
 	close(pomRequests)
 	wgWorkers.Wait()
 
-	// Flatten each BFS tree into table rows.
+	// Flatten BFS trees to table rows.
 	for i := range sections {
 		flattenBFS(&sections[i])
 	}
