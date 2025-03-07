@@ -37,6 +37,6 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: license-report
-          path: ./combined_dependency_report.html
+          path: ./license_compliance_report.html
 
           
