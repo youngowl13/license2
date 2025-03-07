@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -52,7 +53,7 @@ type DependencyNode struct {
 	Copyleft   bool
 	Parent     string            // "direct" or parent's coordinate
 	Transitive []*DependencyNode // child dependencies
-	UsedPOMURL string            // For Maven: the POM URL; for Node/Python: package page link
+	UsedPOMURL string            // For Maven: POM file link; for Node/Python: package page link
 	Direct     string            // top-level dependency that introduced this node
 }
 
@@ -614,6 +615,10 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 		for _, root := range rootNodes {
 			countCopyleftInTree(root, sec)
 		}
+		// Sort the BFS tree nodes recursively
+		for _, root := range sec.DependencyTree {
+			sortDependencyNodes(root)
+		}
 	}
 }
 
@@ -637,6 +642,30 @@ func countCopyleftInTree(node *DependencyNode, sec *ReportSection) {
 	}
 	for _, child := range node.Transitive {
 		countCopyleftInTree(child, sec)
+	}
+}
+
+// sortDependencyNodes recursively sorts nodes so that copyleft (red) come first, then unknown (yellow), then known (green).
+func sortDependencyNodes(node *DependencyNode) {
+	// sort current node's children
+	sort.Slice(node.Transitive, func(i, j int) bool {
+		rank := func(n *DependencyNode) int {
+			if n.Copyleft {
+				return 0
+			} else if strings.EqualFold(n.License, "unknown") {
+				return 1
+			}
+			return 2
+		}
+		ri, rj := rank(node.Transitive[i]), rank(node.Transitive[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return node.Transitive[i].Name < node.Transitive[j].Name
+	})
+	// recursively sort each child
+	for _, child := range node.Transitive {
+		sortDependencyNodes(child)
 	}
 }
 
@@ -805,7 +834,8 @@ func parsePythonDependencies(reqFile string) ([]*DependencyNode, error) {
 
 func parsePyRequiresDistLine(line string) (string, string) {
 	parts := strings.FieldsFunc(line, func(r rune) bool {
-		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '_' || r == '-' || r == '.' {
 			return false
 		}
 		return true
@@ -822,12 +852,9 @@ func resolvePythonDependency(pkgName, version string, visited map[string]bool) (
 		return nil, nil
 	}
 	visited[key] = true
-
-	// Check pythonCache
 	if val, ok := pythonCache.Load(key); ok {
 		return val.(*DependencyNode), nil
 	}
-
 	url := "https://pypi.org/pypi/" + pkgName + "/json"
 	resp, err := http.Get(url)
 	if err != nil {
@@ -897,6 +924,18 @@ func flattenBFS(sec *ReportSection) {
 	var copyleftRows, unknownRows, knownRows []FlattenedDep
 	var walk func(node *DependencyNode)
 	walk = func(node *DependencyNode) {
+		var detail string
+		// Determine "Project Details" based on file type inferred from sec.FilePath
+		lowerPath := strings.ToLower(sec.FilePath)
+		if strings.HasSuffix(lowerPath, "pom.xml") || strings.HasSuffix(lowerPath, "build.gradle") || strings.HasSuffix(lowerPath, ".toml") {
+			// Maven: show non-clickable details from original parser (simulate as "Module: <Name> v<Version>")
+			detail = fmt.Sprintf("Module: %s v%s", node.Name, node.Version)
+		} else if strings.Contains(lowerPath, "package.json") || strings.Contains(lowerPath, "requirements.txt") {
+			// Node/Python: show package page link as is
+			detail = node.UsedPOMURL
+		} else {
+			detail = node.UsedPOMURL
+		}
 		row := FlattenedDep{
 			Dependency: node.Name,
 			Version:    node.Version,
@@ -904,12 +943,12 @@ func flattenBFS(sec *ReportSection) {
 			TopLevel:   node.Direct,
 			License:    node.License,
 			Copyleft:   node.Copyleft,
-			Details:    node.UsedPOMURL,
+			Details:    detail,
 		}
 		switch {
 		case node.Copyleft:
 			copyleftRows = append(copyleftRows, row)
-		case strings.EqualFold(node.License, "Unknown"):
+		case strings.EqualFold(node.License, "unknown"):
 			unknownRows = append(unknownRows, row)
 		default:
 			knownRows = append(knownRows, row)
@@ -994,7 +1033,7 @@ var finalHTML = `
       <td>{{.Parent}}</td>
       <td>{{.TopLevel}}</td>
       <td>{{.License}}</td>
-      <td>{{if .Details}}<a href="{{.Details}}" target="_blank">Link</a>{{end}}</td>
+      <td>{{if .Details}}{{.Details}}{{end}}</td>
     </tr>
     {{end}}
   </table>
@@ -1017,7 +1056,6 @@ var finalHTML = `
   </ul>
   <hr/>
 {{end}}
-
 {{define "subTree"}}
   {{ $data := . }}
   {{range $j, $child := $data.Nodes}}
@@ -1165,7 +1203,7 @@ func main() {
 	close(pomRequests)
 	wgWorkers.Wait()
 
-	// Flatten each BFS tree into table rows.
+	// Flatten BFS trees into table rows.
 	for i := range sections {
 		flattenBFS(&sections[i])
 	}
@@ -1175,7 +1213,6 @@ func main() {
 	}
 	fd := finalData{Sections: sections}
 
-	// Register template helper "dict"
 	funcMap := template.FuncMap{
 		"dict": dict,
 	}
@@ -1195,7 +1232,7 @@ func main() {
 		log.Fatalf("Error executing template: %v", err)
 	}
 
-	fmt.Println("Colored table + BFS dependency report generated at:", outputReportFinal)
+	fmt.Println("Colored table + sorted BFS dependency report generated at:", outputReportFinal)
 }
 
 // ----------------------------------------------------------------------
@@ -1232,4 +1269,29 @@ func dict(values ...interface{}) map[string]interface{} {
 		d[key] = values[i+1]
 	}
 	return d
+}
+
+// ----------------------------------------------------------------------
+// 16) SORTING BFS TREE NODES BY COLOR (copyleft, unknown, known)
+// ----------------------------------------------------------------------
+
+func sortDependencyNodes(node *DependencyNode) {
+	sort.Slice(node.Transitive, func(i, j int) bool {
+		rank := func(n *DependencyNode) int {
+			if n.Copyleft {
+				return 0
+			} else if strings.EqualFold(n.License, "unknown") {
+				return 1
+			}
+			return 2
+		}
+		ri, rj := rank(node.Transitive[i]), rank(node.Transitive[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return node.Transitive[i].Name < node.Transitive[j].Name
+	})
+	for _, child := range node.Transitive {
+		sortDependencyNodes(child)
+	}
 }
