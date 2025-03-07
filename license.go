@@ -40,7 +40,6 @@ var (
 // 2) COMMON TYPES FOR DEPENDENCY TREES & REPORTS
 // ----------------------------------------------------------------------
 
-// DependencyNode represents a dependency in the BFS tree.
 type DependencyNode struct {
 	Name       string
 	Version    string
@@ -52,7 +51,6 @@ type DependencyNode struct {
 	Direct     string            // Top-level dependency that introduced this node
 }
 
-// ExtendedDep holds flattened info.
 type ExtendedDep struct {
 	Display      string
 	Lookup       string
@@ -62,7 +60,6 @@ type ExtendedDep struct {
 	PomURL       string
 }
 
-// ReportSection holds the dependency tree and flattened table for one file.
 type ReportSection struct {
 	FilePath        string
 	DirectDeps      map[string]string // e.g. "group/artifact" => version
@@ -78,7 +75,6 @@ type ReportSection struct {
 	Flattened []FlattenedDep // Flattened table rows
 }
 
-// FlattenedDep represents one row in the final table.
 type FlattenedDep struct {
 	Dependency string
 	Version    string
@@ -89,14 +85,12 @@ type FlattenedDep struct {
 	Details    string // Link (Maven POM or Node/Python details)
 }
 
-// introducerSet is used during BFS bookkeeping.
 type introducerSet map[string]bool
 
 // ----------------------------------------------------------------------
 // 3) TYPES FOR MAVEN FETCHING
 // ----------------------------------------------------------------------
 
-// fetchRequest is used to enqueue remote fetch requests.
 type fetchRequest struct {
 	GroupID    string
 	ArtifactID string
@@ -104,7 +98,6 @@ type fetchRequest struct {
 	ResultChan chan fetchResult
 }
 
-// fetchResult holds the result of a remote fetch.
 type fetchResult struct {
 	POM     *MavenPOM
 	UsedURL string
@@ -410,6 +403,7 @@ func pomFetchWorker() {
 }
 
 func fetchRemotePOM(group, artifact, version string) (*MavenPOM, string, error) {
+	log.Printf("[FETCH] Attempting to fetch POM for %s:%s:%s", group, artifact, version)
 	groupPath := strings.ReplaceAll(group, ".", "/")
 	urlCentral := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, artifact, version, artifact, version)
 	urlGoogle := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, artifact, version, artifact, version)
@@ -420,12 +414,15 @@ func fetchRemotePOM(group, artifact, version string) (*MavenPOM, string, error) 
 		defer resp.Body.Close()
 		data, err := io.ReadAll(resp.Body)
 		if err != nil {
+			log.Printf("[FETCH] Error reading response from Maven Central for %s:%s:%s: %v", group, artifact, version, err)
 			return nil, "", err
 		}
 		var pom MavenPOM
 		if err := xml.Unmarshal(data, &pom); err != nil {
+			log.Printf("[FETCH] Error unmarshaling POM from Maven Central for %s:%s:%s: %v", group, artifact, version, err)
 			return nil, "", err
 		}
+		log.Printf("[FETCH] Successfully fetched POM from Maven Central for %s:%s:%s", group, artifact, version)
 		return &pom, urlCentral, nil
 	}
 	if resp != nil {
@@ -436,17 +433,21 @@ func fetchRemotePOM(group, artifact, version string) (*MavenPOM, string, error) 
 		defer resp2.Body.Close()
 		data, err := io.ReadAll(resp2.Body)
 		if err != nil {
+			log.Printf("[FETCH] Error reading response from Google Maven for %s:%s:%s: %v", group, artifact, version, err)
 			return nil, "", err
 		}
 		var pom MavenPOM
 		if err := xml.Unmarshal(data, &pom); err != nil {
+			log.Printf("[FETCH] Error unmarshaling POM from Google Maven for %s:%s:%s: %v", group, artifact, version, err)
 			return nil, "", err
 		}
+		log.Printf("[FETCH] Successfully fetched POM from Google Maven for %s:%s:%s", group, artifact, version)
 		return &pom, urlGoogle, nil
 	}
 	if resp2 != nil {
 		resp2.Body.Close()
 	}
+	log.Printf("[FETCH] Failed to fetch POM for %s:%s:%s", group, artifact, version)
 	return nil, "", fmt.Errorf("could not fetch POM for %s:%s:%s", group, artifact, version)
 }
 
@@ -638,7 +639,7 @@ func countCopyleftInTree(node *DependencyNode, sec *ReportSection) {
 // 10) NODE & PYTHON BFS PARSING (FULL TRANSITIVE EXPANSION)
 // ----------------------------------------------------------------------
 
-// Define the requirement type for Python/Node parsing.
+// Define the requirement type.
 type requirement struct {
 	name, version string
 }
@@ -901,7 +902,26 @@ func flattenBFS(sec *ReportSection) {
 }
 
 // ----------------------------------------------------------------------
-// 12) FINAL HTML TEMPLATE (TABLE FIRST, THEN COLLAPSIBLE BFS)
+// 12) HELPER: dict (to pass maps to templates)
+// ----------------------------------------------------------------------
+
+func dict(values ...interface{}) map[string]interface{} {
+	if len(values)%2 != 0 {
+		panic("dict expects an even number of arguments")
+	}
+	d := make(map[string]interface{}, len(values)/2)
+	for i := 0; i < len(values); i += 2 {
+		key, ok := values[i].(string)
+		if !ok {
+			panic("dict keys must be strings")
+		}
+		d[key] = values[i+1]
+	}
+	return d
+}
+
+// ----------------------------------------------------------------------
+// 13) FINAL HTML TEMPLATE (TABLE FIRST, THEN COLLAPSIBLE BFS)
 // ----------------------------------------------------------------------
 
 var finalHTML = `
@@ -938,7 +958,6 @@ var finalHTML = `
 </head>
 <body>
 <h1>Combined Dependency Report</h1>
-
 {{range .Sections}}
   {{$fp := .FilePath}}
   <h2>{{$fp}}</h2>
@@ -984,7 +1003,7 @@ var finalHTML = `
       {{if $root.UsedPOMURL}} [<a href="{{$root.UsedPOMURL}}" target="_blank">Link</a>]{{end}}
       {{if $root.Transitive}}
       <ul class="hidden" id="node-{{$fp}}-{{$i}}">
-        {{template "subTree" $root.Transitive $fp (print $i)}}
+        {{template "subTree" (dict "Nodes" $root.Transitive "File" $fp "Prefix" (print $i))}}
       </ul>
       {{end}}
     </li>
@@ -994,18 +1013,16 @@ var finalHTML = `
 {{end}}
 
 {{define "subTree"}}
-  {{- $file := index . 1 -}}
-  {{- $prefix := index . 2 -}}
-  {{- $nodes := index . 0 -}}
-  {{range $j, $child := $nodes}}
+  {{ $data := . }}
+  {{ range $j, $child := $data.Nodes }}
   <li class="tree-item">
-    <span class="toggle-btn" onclick="toggleSubtree('sub-{{$file}}-{{$prefix}}-{{$j}}')">[+/-]</span>
+    <span class="toggle-btn" onclick="toggleSubtree('sub-{{$data.File}}-{{$data.Prefix}}-{{$j}}')">[+/-]</span>
     <strong>{{$child.Name}}@{{$child.Version}}</strong><br/>
     License: <span {{if $child.Copyleft}}class="copyleft"{{else if eq $child.License "Unknown"}}class="unknown"{{end}}>{{$child.License}}</span>
     {{if $child.UsedPOMURL}} [<a href="{{$child.UsedPOMURL}}" target="_blank">Link</a>]{{end}}
     {{if $child.Transitive}}
-    <ul class="hidden" id="sub-{{$file}}-{{$prefix}}-{{$j}}">
-      {{template "subTree" $child.Transitive $file (print $prefix "-" $j)}}
+    <ul class="hidden" id="sub-{{$data.File}}-{{$data.Prefix}}-{{$j}}">
+      {{template "subTree" (dict "Nodes" $child.Transitive "File" $data.File "Prefix" (print $data.Prefix "-" $j))}}
     </ul>
     {{end}}
   </li>
@@ -1016,7 +1033,7 @@ var finalHTML = `
 `
 
 // ----------------------------------------------------------------------
-// 13) MAIN FUNCTION
+// 14) MAIN FUNCTION
 // ----------------------------------------------------------------------
 
 func main() {
@@ -1141,7 +1158,7 @@ func main() {
 	close(pomRequests)
 	wgWorkers.Wait()
 
-	// Flatten BFS trees to table rows.
+	// Flatten each BFS tree into table rows.
 	for i := range sections {
 		flattenBFS(&sections[i])
 	}
@@ -1151,16 +1168,22 @@ func main() {
 	}
 	fd := finalData{Sections: sections}
 
+	// Register the "dict" function so we can pass maps to sub-templates.
+	funcMap := template.FuncMap{
+		"dict": dict,
+	}
+
+	tmpl, err := template.New("report").Funcs(funcMap).Parse(finalHTML)
+	if err != nil {
+		log.Fatalf("Error parsing template: %v", err)
+	}
+
 	f, err := os.Create(outputReportFinal)
 	if err != nil {
 		log.Fatalf("Cannot create final HTML: %v", err)
 	}
 	defer f.Close()
 
-	tmpl, err := template.New("report").Parse(finalHTML)
-	if err != nil {
-		log.Fatalf("Error parsing template: %v", err)
-	}
 	if err := tmpl.Execute(f, fd); err != nil {
 		log.Fatalf("Error executing template: %v", err)
 	}
@@ -1183,4 +1206,23 @@ func countTotalDependencies(nodes []*DependencyNode) int {
 	}
 	rec(nodes)
 	return count
+}
+
+// ----------------------------------------------------------------------
+// 15) TEMPLATE HELPER: dict
+// ----------------------------------------------------------------------
+
+func dict(values ...interface{}) map[string]interface{} {
+	if len(values)%2 != 0 {
+		panic("dict expects an even number of arguments")
+	}
+	d := make(map[string]interface{}, len(values)/2)
+	for i := 0; i < len(values); i += 2 {
+		key, ok := values[i].(string)
+		if !ok {
+			panic("dict keys must be strings")
+		}
+		d[key] = values[i+1]
+	}
+	return d
 }
