@@ -53,7 +53,7 @@ type DependencyNode struct {
 	Copyleft   bool
 	Parent     string            // "direct" or parent's coordinate
 	Transitive []*DependencyNode // BFS children
-	UsedPOMURL string            // For Maven: actual POM fetch URL; for Node/Python: package page link
+	UsedPOMURL string            // For Maven => actual POM fetch URL; for Node/Python => package page
 	Direct     string            // top-level dependency that introduced this node
 }
 
@@ -81,7 +81,7 @@ type ReportSection struct {
 	Flattened []FlattenedDep
 }
 
-// FlattenedDep holds data for each table row in the HTML table.
+// FlattenedDep holds data for each row in the final table.
 type FlattenedDep struct {
 	Dependency string
 	Version    string
@@ -237,6 +237,7 @@ func isCopyleftChecker(license string) bool {
 	return false
 }
 
+// parseVersionRange attempts to handle things like [1.0.0, 2.0.0)
 func parseVersionRange(v string) string {
 	v = strings.TrimSpace(v)
 	if (strings.HasPrefix(v, "[") || strings.HasPrefix(v, "(")) && strings.Contains(v, ",") {
@@ -251,7 +252,7 @@ func parseVersionRange(v string) string {
 
 // buildMavenLink => direct artifact link
 // If group starts with "com.android.tools", link to maven.google.com
-// otherwise link to mvnrepository.com
+// else link to mvnrepository.com
 func buildMavenLink(group, artifact, version string) string {
 	if strings.HasPrefix(group, "com.android.tools") {
 		return fmt.Sprintf("https://maven.google.com/web/index.html#%s:%s:%s", group, artifact, version)
@@ -592,7 +593,6 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 			}
 		}
 
-		// Mark introducedBy
 		for _, root := range rootNodes {
 			setIntroducedBy(root, root.Name, allDeps)
 		}
@@ -615,16 +615,15 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 		}
 		sec.IndirectCount = sec.TransitiveCount - sec.DirectCount
 
-		// Count copyleft
+		// BFS => count copyleft
 		for _, root := range rootNodes {
 			countCopyleftInTree(root, sec)
 		}
 
-		// Sort BFS root nodes by color
+		// Sort BFS root nodes
 		sort.Slice(rootNodes, func(i, j int) bool {
 			return colorRank(rootNodes[i]) < colorRank(rootNodes[j])
 		})
-		// Recursively sort BFS children
 		for _, root := range rootNodes {
 			sortDependencyNodes(root)
 		}
@@ -654,7 +653,7 @@ func countCopyleftInTree(node *DependencyNode, sec *ReportSection) {
 	}
 }
 
-// colorRank returns 0 for copyleft, 1 for unknown, 2 for known.
+// colorRank => 0=red(copyleft), 1=yellow(unknown), 2=green(known)
 func colorRank(n *DependencyNode) int {
 	if n.Copyleft {
 		return 0
@@ -664,7 +663,6 @@ func colorRank(n *DependencyNode) int {
 	return 2
 }
 
-// sortDependencyNodes recursively sorts a node's children by color then by name.
 func sortDependencyNodes(node *DependencyNode) {
 	sort.Slice(node.Transitive, func(i, j int) bool {
 		ri := colorRank(node.Transitive[i])
@@ -727,6 +725,7 @@ func resolveNodeDependency(pkgName, version string, visited map[string]bool) (*D
 		return nil, err
 	}
 	defer resp.Body.Close()
+
 	var data map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return nil, err
@@ -934,11 +933,16 @@ func flattenBFS(sec *ReportSection) {
 
 	var walk func(node *DependencyNode)
 	walk = func(node *DependencyNode) {
-		// If the version contains a placeholder like "${...}", treat as "unknown".
+		// 1) If the version contains a placeholder like "${...}", treat as "unknown".
+		// 2) Remove bracket/parenthesis chars: [ ] ( )
 		versionToUse := node.Version
 		if strings.Contains(versionToUse, "${") {
 			versionToUse = "unknown"
 		}
+		versionToUse = strings.ReplaceAll(versionToUse, "[", "")
+		versionToUse = strings.ReplaceAll(versionToUse, "]", "")
+		versionToUse = strings.ReplaceAll(versionToUse, "(", "")
+		versionToUse = strings.ReplaceAll(versionToUse, ")", "")
 
 		lowerPath := strings.ToLower(sec.FilePath)
 		var detail string
@@ -947,7 +951,7 @@ func flattenBFS(sec *ReportSection) {
 			strings.HasSuffix(lowerPath, "build.gradle") ||
 			strings.HasSuffix(lowerPath, ".toml") {
 
-			// For Maven/TOML/Gradle => produce a direct artifact link
+			// For Maven/TOML/Gradle => produce direct artifact link
 			grp, art := splitGA(node.Name)
 			artifactURL := buildMavenLink(grp, art, versionToUse)
 			detail = fmt.Sprintf(
@@ -979,7 +983,7 @@ func flattenBFS(sec *ReportSection) {
 			Details:    detail,
 		}
 
-		// Put row into one of three buckets
+		// Sort into copyleft / unknown / known
 		if node.Copyleft {
 			copyleftRows = append(copyleftRows, row)
 		} else if strings.EqualFold(node.License, "unknown") {
