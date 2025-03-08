@@ -81,8 +81,7 @@ type ReportSection struct {
 	Flattened []FlattenedDep
 }
 
-// FlattenedDep holds data for each table row.
-// The Details field will contain raw HTML (a clickable link).
+// FlattenedDep holds data for each table row in the HTML table.
 type FlattenedDep struct {
 	Dependency string
 	Version    string
@@ -90,13 +89,13 @@ type FlattenedDep struct {
 	TopLevel   string
 	License    string
 	Copyleft   bool
-	Details    string
+	Details    string // raw HTML anchor link
 }
 
 type introducerSet map[string]bool
 
 // ----------------------------------------------------------------------
-// 3) MAVEN FETCHING TYPES
+// 3) MAVEN FETCHING
 // ----------------------------------------------------------------------
 
 type fetchRequest struct {
@@ -143,7 +142,7 @@ type MavenPOM struct {
 }
 
 // ----------------------------------------------------------------------
-// 5) FILE DISCOVERY FUNCTIONS
+// 5) FILE DISCOVERY
 // ----------------------------------------------------------------------
 
 func findAllPOMFiles(root string) ([]string, error) {
@@ -250,12 +249,9 @@ func parseVersionRange(v string) string {
 	return v
 }
 
-// ----------------------------------------------------------------------
-// LINK BUILDING FUNCTION FOR MAVEN ARTIFACTS
-// ----------------------------------------------------------------------
-// buildMavenLink returns a direct link for the "Project Details" column.
-// If the group starts with "com.android.tools", it uses maven.google.com;
-// otherwise, it uses mvnrepository.com.
+// buildMavenLink => direct artifact link
+// If group starts with "com.android.tools", link to maven.google.com
+// otherwise link to mvnrepository.com
 func buildMavenLink(group, artifact, version string) string {
 	if strings.HasPrefix(group, "com.android.tools") {
 		return fmt.Sprintf("https://maven.google.com/web/index.html#%s:%s:%s", group, artifact, version)
@@ -264,7 +260,7 @@ func buildMavenLink(group, artifact, version string) string {
 }
 
 // ----------------------------------------------------------------------
-// 7) PARSING FUNCTIONS: MAVEN, TOML, GRADLE
+// 7) PARSING: MAVEN, TOML, GRADLE
 // ----------------------------------------------------------------------
 
 func parseOneLocalPOMFile(filePath string) (map[string]string, error) {
@@ -410,7 +406,7 @@ func parseGradleVariables(content string) map[string]string {
 }
 
 // ----------------------------------------------------------------------
-// 8) MAVEN BFS WORKER & FETCH FUNCTIONS
+// 8) MAVEN BFS WORKER & FETCH
 // ----------------------------------------------------------------------
 
 func pomFetchWorker() {
@@ -658,7 +654,7 @@ func countCopyleftInTree(node *DependencyNode, sec *ReportSection) {
 	}
 }
 
-// colorRank returns 0 for copyleft, 1 for unknown, and 2 for known.
+// colorRank returns 0 for copyleft, 1 for unknown, 2 for known.
 func colorRank(n *DependencyNode) int {
 	if n.Copyleft {
 		return 0
@@ -938,28 +934,52 @@ func flattenBFS(sec *ReportSection) {
 
 	var walk func(node *DependencyNode)
 	walk = func(node *DependencyNode) {
+		// If the version contains a placeholder like "${...}", treat as "unknown".
+		versionToUse := node.Version
+		if strings.Contains(versionToUse, "${") {
+			versionToUse = "unknown"
+		}
+
 		lowerPath := strings.ToLower(sec.FilePath)
 		var detail string
+
 		if strings.HasSuffix(lowerPath, "pom.xml") ||
 			strings.HasSuffix(lowerPath, "build.gradle") ||
 			strings.HasSuffix(lowerPath, ".toml") {
+
+			// For Maven/TOML/Gradle => produce a direct artifact link
 			grp, art := splitGA(node.Name)
-			detail = buildMavenLink(grp, art, node.Version)
+			artifactURL := buildMavenLink(grp, art, versionToUse)
+			detail = fmt.Sprintf(
+				`<a href="%s" target="_blank">%s:%s:%s</a>`,
+				artifactURL, grp, art, versionToUse,
+			)
+
 		} else if strings.Contains(lowerPath, "package.json") ||
 			strings.Contains(lowerPath, "requirements.txt") {
-			detail = fmt.Sprintf(`<a href="%s" target="_blank">%s@%s</a>`, node.UsedPOMURL, node.Name, node.Version)
+
+			// Node/Python => link to package page
+			detail = fmt.Sprintf(
+				`<a href="%s" target="_blank">%s@%s</a>`,
+				node.UsedPOMURL, node.Name, node.Version,
+			)
+
 		} else {
+			// fallback
 			detail = node.UsedPOMURL
 		}
+
 		row := FlattenedDep{
 			Dependency: node.Name,
-			Version:    node.Version,
+			Version:    versionToUse,
 			Parent:     node.Parent,
 			TopLevel:   node.Direct,
 			License:    node.License,
 			Copyleft:   node.Copyleft,
 			Details:    detail,
 		}
+
+		// Put row into one of three buckets
 		if node.Copyleft {
 			copyleftRows = append(copyleftRows, row)
 		} else if strings.EqualFold(node.License, "unknown") {
@@ -967,18 +987,22 @@ func flattenBFS(sec *ReportSection) {
 		} else {
 			knownRows = append(knownRows, row)
 		}
+
 		for _, child := range node.Transitive {
 			walk(child)
 		}
 	}
+
 	for _, root := range sec.DependencyTree {
 		walk(root)
 	}
+
+	// Combine: copyleft first, unknown second, known last
 	sec.Flattened = append(copyleftRows, append(unknownRows, knownRows...)...)
 }
 
 // ----------------------------------------------------------------------
-// TEMPLATE HELPER: dict (single definition)
+// 12) TEMPLATE HELPER: dict
 // ----------------------------------------------------------------------
 
 func dict(values ...interface{}) map[string]interface{} {
@@ -997,9 +1021,8 @@ func dict(values ...interface{}) map[string]interface{} {
 }
 
 // ----------------------------------------------------------------------
-// 14) FINAL HTML TEMPLATE
+// 13) FINAL HTML TEMPLATE
 // ----------------------------------------------------------------------
-// The template uses a custom pipeline "safeHTML" so that the Details field renders as HTML.
 
 var finalHTML = `
 <!DOCTYPE html>
@@ -1013,12 +1036,15 @@ var finalHTML = `
     table { border-collapse: collapse; width: 95%; margin: 1em 0; }
     th, td { border: 1px solid #ccc; padding: 6px 8px; }
     th { background: #f7f7f7; }
+
     tr.copyleft { background-color: #ffcccc; }
     tr.unknown  { background-color: #ffffcc; }
     tr.known    { background-color: #ccffcc; }
+
     li.copyleft { background-color: #ffcccc; margin-bottom: 0.3em; padding: 4px; }
     li.unknown  { background-color: #ffffcc; margin-bottom: 0.3em; padding: 4px; }
     li.known    { background-color: #ccffcc; margin-bottom: 0.3em; padding: 4px; }
+
     .toggle-btn { cursor: pointer; font-weight: bold; color: #007bff; margin-right: 5px; }
     .toggle-btn:hover { text-decoration: underline; }
     .hidden { display: none; }
@@ -1040,6 +1066,7 @@ var finalHTML = `
 </head>
 <body>
 <h1>Combined Dependency Report</h1>
+
 {{range .Sections}}
   {{$fp := .FilePath}}
   <h2>{{$fp}}</h2>
@@ -1050,6 +1077,7 @@ var finalHTML = `
     Copyleft: {{.CopyleftCount}}<br/>
     Unknown: {{.UnknownCount}}
   </p>
+
   <h3>Dependency Table</h3>
   <table>
     <tr>
@@ -1071,6 +1099,7 @@ var finalHTML = `
     </tr>
     {{end}}
   </table>
+
   <h3>Dependency Tree</h3>
   <ul class="tree">
     {{range $i, $root := .DependencyTree}}
@@ -1081,6 +1110,7 @@ var finalHTML = `
       <br/>
       License: {{$root.License}}<br/>
       POM File Link: {{if $root.UsedPOMURL}}<a href="{{$root.UsedPOMURL}}" target="_blank">Open</a>{{else}}(none){{end}}
+
       {{if $root.Transitive}}
       <ul class="hidden" id="node-{{$fp}}-{{$i}}">
         {{template "subTree" (dict "Nodes" $root.Transitive "File" $fp "Prefix" (print $i))}}
@@ -1091,6 +1121,7 @@ var finalHTML = `
   </ul>
   <hr/>
 {{end}}
+
 {{define "subTree"}}
   {{$data := .}}
   {{range $j, $child := $data.Nodes}}
@@ -1101,6 +1132,7 @@ var finalHTML = `
     <br/>
     License: {{$child.License}}<br/>
     POM File Link: {{if $child.UsedPOMURL}}<a href="{{$child.UsedPOMURL}}" target="_blank">Open</a>{{else}}(none){{end}}
+
     {{if $child.Transitive}}
     <ul class="hidden" id="sub-{{$data.File}}-{{$data.Prefix}}-{{$j}}">
       {{template "subTree" (dict "Nodes" $child.Transitive "File" $data.File "Prefix" (print $data.Prefix "-" $j))}}
@@ -1114,11 +1146,11 @@ var finalHTML = `
 `
 
 // ----------------------------------------------------------------------
-// 15) MAIN FUNCTION
+// 16) MAIN
 // ----------------------------------------------------------------------
 
 func main() {
-	// Start Maven BFS workers.
+	// Start Maven BFS workers
 	for i := 0; i < pomWorkerCount; i++ {
 		wgWorkers.Add(1)
 		go pomFetchWorker()
@@ -1128,7 +1160,7 @@ func main() {
 
 	var sections []ReportSection
 
-	// Maven Files
+	// 1) Maven
 	pomFiles, err := findAllPOMFiles(rootDir)
 	if err != nil {
 		log.Println("Error finding pom.xml files:", err)
@@ -1147,7 +1179,7 @@ func main() {
 		sections = append(sections, rs)
 	}
 
-	// TOML Files
+	// 2) TOML
 	tomlFiles, err := findAllTOMLFiles(rootDir)
 	if err != nil {
 		log.Println("Error finding .toml files:", err)
@@ -1166,7 +1198,7 @@ func main() {
 		sections = append(sections, rs)
 	}
 
-	// Gradle Files
+	// 3) Gradle
 	gradleFiles, err := findAllGradleFiles(rootDir)
 	if err != nil {
 		log.Println("Error finding Gradle files:", err)
@@ -1188,7 +1220,7 @@ func main() {
 	// BFS expansions for Maven/TOML/Gradle
 	buildTransitiveClosureJavaLike(sections)
 
-	// Node Dependencies
+	// 4) Node BFS
 	nodeFile := findFile(rootDir, "package.json")
 	if nodeFile != "" {
 		nodeDeps, err := parseNodeDependencies(nodeFile)
@@ -1212,7 +1244,7 @@ func main() {
 		}
 	}
 
-	// Python Dependencies
+	// 5) Python BFS
 	pyFile := findFile(rootDir, "requirements.txt")
 	if pyFile != "" {
 		pyDeps, err := parsePythonDependencies(pyFile)
@@ -1236,10 +1268,11 @@ func main() {
 		}
 	}
 
+	// Close BFS channel
 	close(pomRequests)
 	wgWorkers.Wait()
 
-	// Flatten BFS trees into table rows.
+	// Flatten BFS => table
 	for i := range sections {
 		flattenBFS(&sections[i])
 	}
@@ -1249,7 +1282,7 @@ func main() {
 	}
 	fd := finalData{Sections: sections}
 
-	// Template function map: safeHTML and dict.
+	// Template function map => safeHTML + dict
 	funcMap := template.FuncMap{
 		"safeHTML": func(s string) template.HTML {
 			return template.HTML(s)
@@ -1272,7 +1305,7 @@ func main() {
 		log.Fatalf("Error executing template: %v", err)
 	}
 
-	fmt.Println("Colored table + sorted BFS dependency report generated at:", outputReportFinal)
+	fmt.Println("Colored table + BFS dependency report generated at:", outputReportFinal)
 }
 
 // ----------------------------------------------------------------------
