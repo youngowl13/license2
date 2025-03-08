@@ -52,8 +52,8 @@ type DependencyNode struct {
 	License    string
 	Copyleft   bool
 	Parent     string            // "direct" or parent's coordinate
-	Transitive []*DependencyNode // child dependencies
-	UsedPOMURL string            // BFS link => "POM File Link" for Maven or package page for Node/Python
+	Transitive []*DependencyNode // BFS children
+	UsedPOMURL string            // For Maven => actual POM fetch URL; Node/Python => package page
 	Direct     string            // top-level dependency that introduced this node
 }
 
@@ -409,11 +409,13 @@ func pomFetchWorker() {
 
 func fetchRemotePOM(group, artifact, version string) (*MavenPOM, string, error) {
 	log.Printf("[FETCH] Attempting to fetch POM for %s:%s:%s", group, artifact, version)
+
 	groupPath := strings.ReplaceAll(group, ".", "/")
 	urlCentral := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, artifact, version, artifact, version)
 	urlGoogle := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, artifact, version, artifact, version)
 	client := http.Client{Timeout: fetchTimeout}
 
+	// Try Maven Central
 	resp, err := client.Get(urlCentral)
 	if err == nil && resp.StatusCode == 200 {
 		defer resp.Body.Close()
@@ -433,6 +435,8 @@ func fetchRemotePOM(group, artifact, version string) (*MavenPOM, string, error) 
 	if resp != nil {
 		resp.Body.Close()
 	}
+
+	// Try Google Maven
 	resp2, err2 := client.Get(urlGoogle)
 	if err2 == nil && resp2.StatusCode == 200 {
 		defer resp2.Body.Close()
@@ -452,6 +456,7 @@ func fetchRemotePOM(group, artifact, version string) (*MavenPOM, string, error) 
 	if resp2 != nil {
 		resp2.Body.Close()
 	}
+
 	log.Printf("[FETCH] Failed to fetch POM for %s:%s:%s", group, artifact, version)
 	return nil, "", fmt.Errorf("could not fetch POM for %s:%s:%s", group, artifact, version)
 }
@@ -461,9 +466,11 @@ func concurrentFetchPOM(group, artifact, version string) (*MavenPOM, string, err
 	if cached, ok := pomCache.Load(key); ok {
 		return cached.(*MavenPOM), "", nil
 	}
+
 	channelMutex.Lock()
 	open := channelOpen
 	channelMutex.Unlock()
+
 	if !open {
 		pom, urlUsed, err := fetchRemotePOM(group, artifact, version)
 		if err == nil && pom != nil {
@@ -471,6 +478,7 @@ func concurrentFetchPOM(group, artifact, version string) (*MavenPOM, string, err
 		}
 		return pom, urlUsed, err
 	}
+
 	req := fetchRequest{
 		GroupID:    group,
 		ArtifactID: artifact,
@@ -478,6 +486,7 @@ func concurrentFetchPOM(group, artifact, version string) (*MavenPOM, string, err
 		ResultChan: make(chan fetchResult, 1),
 	}
 	pomRequests <- req
+
 	res := <-req.ResultChan
 	if res.Err == nil && res.POM != nil {
 		pomCache.Store(key, res.POM)
@@ -501,11 +510,13 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 	for i := range sections {
 		sec := &sections[i]
 		log.Printf("[BFS] Building BFS for %s", sec.FilePath)
+
 		allDeps := make(map[string]ExtendedDep)
 		for ga, ver := range sec.DirectDeps {
 			key := ga + "@" + ver
 			allDeps[key] = ExtendedDep{Display: ver, Lookup: ver, Parent: "direct"}
 		}
+
 		visited := make(map[string]introducerSet)
 		var queue []queueItem
 		var rootNodes []*DependencyNode
@@ -516,6 +527,7 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 			ds := make(introducerSet)
 			ds[ga] = true
 			visited[key] = ds
+
 			node := &DependencyNode{
 				Name:    ga,
 				Version: ver,
@@ -523,6 +535,7 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 				Direct:  ga,
 			}
 			rootNodes = append(rootNodes, node)
+
 			queue = append(queue, queueItem{
 				GroupArtifact: ga,
 				Version:       ver,
@@ -578,6 +591,7 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 				ds := make(introducerSet)
 				ds[it.Direct] = true
 				visited[childKey] = ds
+
 				childNode := &DependencyNode{
 					Name:    childGA,
 					Version: cv,
@@ -585,6 +599,7 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 					Direct:  it.Direct,
 				}
 				it.ParentNode.Transitive = append(it.ParentNode.Transitive, childNode)
+
 				queue = append(queue, queueItem{
 					GroupArtifact: childGA,
 					Version:       cv,
@@ -601,11 +616,11 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 		}
 		sec.DependencyTree = rootNodes
 
-		// Flatten extended info
 		for k, v := range allDeps {
 			sec.AllDeps[k] = v
 		}
 		sec.DirectCount = len(sec.DirectDeps)
+
 		for key := range sec.AllDeps {
 			if strings.Contains(key, "@") {
 				parts := strings.Split(key, "@")
@@ -628,20 +643,11 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 		sort.Slice(rootNodes, func(i, j int) bool {
 			return colorRank(rootNodes[i]) < colorRank(rootNodes[j])
 		})
-		// Sort BFS children recursively
+		// Recursively sort BFS children
 		for _, root := range rootNodes {
 			sortDependencyNodes(root)
 		}
 	}
-}
-
-func colorRank(n *DependencyNode) int {
-	if n.Copyleft {
-		return 0
-	} else if strings.EqualFold(n.License, "unknown") {
-		return 1
-	}
-	return 2
 }
 
 func setIntroducedBy(node *DependencyNode, rootName string, all map[string]ExtendedDep) {
@@ -665,6 +671,16 @@ func countCopyleftInTree(node *DependencyNode, sec *ReportSection) {
 	for _, child := range node.Transitive {
 		countCopyleftInTree(child, sec)
 	}
+}
+
+// colorRank: 0 => copyleft, 1 => unknown, 2 => known
+func colorRank(n *DependencyNode) int {
+	if n.Copyleft {
+		return 0
+	} else if strings.EqualFold(n.License, "unknown") {
+		return 1
+	}
+	return 2
 }
 
 // ----------------------------------------------------------------------
@@ -706,6 +722,7 @@ func resolveNodeDependency(pkgName, version string, visited map[string]bool) (*D
 		return nil, nil
 	}
 	visited[key] = true
+
 	if val, ok := nodeCache.Load(key); ok {
 		return val.(*DependencyNode), nil
 	}
@@ -715,6 +732,7 @@ func resolveNodeDependency(pkgName, version string, visited map[string]bool) (*D
 		return nil, err
 	}
 	defer resp.Body.Close()
+
 	var data map[string]interface{}
 	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
 		return nil, err
@@ -732,7 +750,6 @@ func resolveNodeDependency(pkgName, version string, visited map[string]bool) (*D
 	}
 	verData, ok := vs[version].(map[string]interface{})
 	if !ok {
-		// fallback
 		if dist, ok2 := data["dist-tags"].(map[string]interface{}); ok2 {
 			if lat, ok2 := dist["latest"].(string); ok2 {
 				if vMap, ok3 := vs[lat].(map[string]interface{}); ok3 {
@@ -850,6 +867,7 @@ func resolvePythonDependency(pkgName, version string, visited map[string]bool) (
 		return nil, nil
 	}
 	visited[key] = true
+
 	if val, ok := pythonCache.Load(key); ok {
 		return val.(*DependencyNode), nil
 	}
@@ -859,6 +877,7 @@ func resolvePythonDependency(pkgName, version string, visited map[string]bool) (
 		return nil, err
 	}
 	defer resp.Body.Close()
+
 	if resp.StatusCode != 200 {
 		return nil, fmt.Errorf("PyPI returned status %d for package: %s", resp.StatusCode, pkgName)
 	}
@@ -921,7 +940,7 @@ func resolvePythonDependency(pkgName, version string, visited map[string]bool) (
 func flattenBFS(sec *ReportSection) {
 	var copyleftRows, unknownRows, knownRows []FlattenedDep
 
-	// We'll do a DFS and place each node into one of the three slices
+	// We'll do a DFS to place each node into one of the three slices
 	var walk func(node *DependencyNode)
 	walk = func(node *DependencyNode) {
 		// Determine the text for "Project Details" column
@@ -930,14 +949,13 @@ func flattenBFS(sec *ReportSection) {
 		if strings.HasSuffix(lowerPath, "pom.xml") ||
 			strings.HasSuffix(lowerPath, "build.gradle") ||
 			strings.HasSuffix(lowerPath, ".toml") {
-			// For Maven/TOML/Gradle => plain text
+			// For Maven/TOML/Gradle => plain text from original parser style
 			detail = fmt.Sprintf("Module: %s v%s", node.Name, node.Version)
 		} else if strings.Contains(lowerPath, "package.json") ||
 			strings.Contains(lowerPath, "requirements.txt") {
-			// For Node/Python => link to registry
+			// For Node/Python => link
 			detail = node.UsedPOMURL
 		} else {
-			// fallback
 			detail = node.UsedPOMURL
 		}
 
@@ -989,12 +1007,17 @@ var finalHTML = `
     table { border-collapse: collapse; width: 95%; margin: 1em 0; }
     th, td { border: 1px solid #ccc; padding: 6px 8px; }
     th { background: #f7f7f7; }
+
+    /* Table row colors */
     tr.copyleft { background-color: #ffcccc; }  /* red */
     tr.unknown  { background-color: #ffffcc; }  /* yellow */
     tr.known    { background-color: #ccffcc; }  /* green */
+
+    /* BFS li colors */
     li.copyleft { background-color: #ffcccc; margin-bottom: 0.3em; padding: 4px; }
     li.unknown  { background-color: #ffffcc; margin-bottom: 0.3em; padding: 4px; }
     li.known    { background-color: #ccffcc; margin-bottom: 0.3em; padding: 4px; }
+
     .toggle-btn { cursor: pointer; font-weight: bold; color: #007bff; margin-right: 5px; }
     .toggle-btn:hover { text-decoration: underline; }
     .hidden { display: none; }
@@ -1308,6 +1331,7 @@ func sortDependencyNodes(node *DependencyNode) {
 	}
 }
 
+// colorRank => 0=red(copyleft), 1=yellow(unknown), 2=green(known)
 func colorRank(n *DependencyNode) int {
 	if n.Copyleft {
 		return 0
