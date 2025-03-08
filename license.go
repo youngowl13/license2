@@ -81,6 +81,8 @@ type ReportSection struct {
 	Flattened []FlattenedDep
 }
 
+// FlattenedDep holds data for each table row.
+// The Details field will contain raw HTML (a clickable link).
 type FlattenedDep struct {
 	Dependency string
 	Version    string
@@ -88,7 +90,7 @@ type FlattenedDep struct {
 	TopLevel   string
 	License    string
 	Copyleft   bool
-	Details    string // "Project Details" column (HTML link)
+	Details    string
 }
 
 type introducerSet map[string]bool
@@ -248,7 +250,7 @@ func parseVersionRange(v string) string {
 	return v
 }
 
-// Build a Maven Central link for the "Project Details" column
+// Build a Maven Central search link for the "Project Details" column
 func buildMavenCentralLink(group, artifact, version string) string {
 	return fmt.Sprintf(
 		`<a href="https://search.maven.org/search?q=g:%s%%20AND%%20a:%s%%20AND%%20v:%s" target="_blank">Module: %s/%s v%s</a>`,
@@ -257,7 +259,7 @@ func buildMavenCentralLink(group, artifact, version string) string {
 }
 
 // ----------------------------------------------------------------------
-// 7) PARSING MAVEN/TOML/GRADLE
+// 7) PARSING FUNCTIONS: MAVEN, TOML, GRADLE
 // ----------------------------------------------------------------------
 
 func parseOneLocalPOMFile(filePath string) (map[string]string, error) {
@@ -436,7 +438,6 @@ func fetchRemotePOM(group, artifact, version string) (*MavenPOM, string, error) 
 	if resp != nil {
 		resp.Body.Close()
 	}
-
 	resp2, err2 := client.Get(urlGoogle)
 	if err2 == nil && resp2.StatusCode == 200 {
 		defer resp2.Body.Close()
@@ -598,7 +599,6 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 		for k, v := range allDeps {
 			sec.AllDeps[k] = v
 		}
-
 		sec.DirectCount = len(sec.DirectDeps)
 		for key := range sec.AllDeps {
 			if strings.Contains(key, "@") {
@@ -653,7 +653,7 @@ func countCopyleftInTree(node *DependencyNode, sec *ReportSection) {
 	}
 }
 
-// colorRank => 0=red(copyleft), 1=yellow(unknown), 2=green(known)
+// colorRank returns 0 for copyleft, 1 for unknown, and 2 for known.
 func colorRank(n *DependencyNode) int {
 	if n.Copyleft {
 		return 0
@@ -661,6 +661,21 @@ func colorRank(n *DependencyNode) int {
 		return 1
 	}
 	return 2
+}
+
+// sortDependencyNodes recursively sorts a node's children by color and then name.
+func sortDependencyNodes(node *DependencyNode) {
+	sort.Slice(node.Transitive, func(i, j int) bool {
+		ri := colorRank(node.Transitive[i])
+		rj := colorRank(node.Transitive[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return node.Transitive[i].Name < node.Transitive[j].Name
+	})
+	for _, child := range node.Transitive {
+		sortDependencyNodes(child)
+	}
 }
 
 // ----------------------------------------------------------------------
@@ -979,6 +994,7 @@ func dict(values ...interface{}) map[string]interface{} {
 // ----------------------------------------------------------------------
 // 13) FINAL HTML TEMPLATE
 // ----------------------------------------------------------------------
+// The template uses a custom pipeline "safeHTML" to render the Details field as HTML.
 
 var finalHTML = `
 <!DOCTYPE html>
@@ -1093,26 +1109,7 @@ var finalHTML = `
 `
 
 // ----------------------------------------------------------------------
-// 14) TEMPLATE HELPER: dict
-// ----------------------------------------------------------------------
-
-func dict(values ...interface{}) map[string]interface{} {
-	if len(values)%2 != 0 {
-		panic("dict expects an even number of arguments")
-	}
-	m := make(map[string]interface{}, len(values)/2)
-	for i := 0; i < len(values); i += 2 {
-		key, ok := values[i].(string)
-		if !ok {
-			panic("dict keys must be strings")
-		}
-		m[key] = values[i+1]
-	}
-	return m
-}
-
-// ----------------------------------------------------------------------
-// 15) MAIN FUNCTION
+// 14) MAIN FUNCTION
 // ----------------------------------------------------------------------
 
 func main() {
@@ -1186,7 +1183,7 @@ func main() {
 	// BFS expansions for Maven/TOML/Gradle
 	buildTransitiveClosureJavaLike(sections)
 
-	// 4) Node BFS
+	// 4) Node Dependencies
 	nodeFile := findFile(rootDir, "package.json")
 	if nodeFile != "" {
 		nodeDeps, err := parseNodeDependencies(nodeFile)
@@ -1210,7 +1207,7 @@ func main() {
 		}
 	}
 
-	// 5) Python BFS
+	// 5) Python Dependencies
 	pyFile := findFile(rootDir, "requirements.txt")
 	if pyFile != "" {
 		pyDeps, err := parsePythonDependencies(pyFile)
@@ -1237,7 +1234,7 @@ func main() {
 	close(pomRequests)
 	wgWorkers.Wait()
 
-	// Flatten BFS trees into table rows.
+	// Flatten each BFS tree into table rows.
 	for i := range sections {
 		flattenBFS(&sections[i])
 	}
@@ -1247,7 +1244,7 @@ func main() {
 	}
 	fd := finalData{Sections: sections}
 
-	// Template function map: safeHTML and dict
+	// Template function map: safeHTML and dict.
 	funcMap := template.FuncMap{
 		"safeHTML": func(s string) template.HTML {
 			return template.HTML(s)
