@@ -53,7 +53,7 @@ type DependencyNode struct {
 	Copyleft   bool
 	Parent     string            // "direct" or parent's coordinate
 	Transitive []*DependencyNode // BFS children
-	UsedPOMURL string            // For Maven => actual POM fetch URL; for Node/Python => package page link
+	UsedPOMURL string            // For Maven => actual POM fetch URL; Node/Python => package page link
 	Direct     string            // top-level dependency that introduced this node
 }
 
@@ -81,6 +81,7 @@ type ReportSection struct {
 	Flattened []FlattenedDep
 }
 
+// FlattenedDep => one row in the final table.
 type FlattenedDep struct {
 	Dependency string
 	Version    string
@@ -236,7 +237,7 @@ func isCopyleftChecker(license string) bool {
 	return false
 }
 
-// parseVersionRange => remove bracketed version ranges
+// parseVersionRange => remove bracketed version ranges, e.g. [1.0,2.0)
 func parseVersionRange(v string) string {
 	v = strings.TrimSpace(v)
 	if (strings.HasPrefix(v, "[") || strings.HasPrefix(v, "(")) && strings.Contains(v, ",") {
@@ -252,8 +253,10 @@ func parseVersionRange(v string) string {
 // buildMavenLink => direct artifact link
 func buildMavenLink(group, artifact, version string) string {
 	if strings.HasPrefix(group, "com.android.tools") {
+		// Google
 		return fmt.Sprintf("https://maven.google.com/web/index.html#%s:%s:%s", group, artifact, version)
 	}
+	// Default => mvnrepository
 	return fmt.Sprintf("https://mvnrepository.com/artifact/%s/%s/%s", group, artifact, version)
 }
 
@@ -261,6 +264,7 @@ func buildMavenLink(group, artifact, version string) string {
 // 7) PARSING: MAVEN, TOML, GRADLE
 // ----------------------------------------------------------------------
 
+// parseOneLocalPOMFile => standard
 func parseOneLocalPOMFile(filePath string) (map[string]string, error) {
 	data, err := os.ReadFile(filePath)
 	if err != nil {
@@ -285,60 +289,63 @@ func parseOneLocalPOMFile(filePath string) (map[string]string, error) {
 	return deps, nil
 }
 
-// EXACT logic from single maven program for TOML
+// parseTOMLFile => handle inline tables with group, name, version.ref
 func parseTOMLFile(filePath string) (map[string]string, error) {
 	tree, err := toml.LoadFile(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("error loading TOML file '%s': %v", filePath, err)
 	}
-	deps := make(map[string]string)
 
-	// 1) Load the [versions] table
+	// Load [versions] table
 	versions, err := loadVersions(tree)
 	if err != nil {
 		return nil, err
 	}
 
-	// 2) Must have a [libraries] table
 	librariesTree := tree.Get("libraries")
 	if librariesTree == nil {
 		return nil, fmt.Errorf("TOML file '%s' does not contain a 'libraries' table", filePath)
 	}
-	libraries, ok := librariesTree.(*toml.Tree)
+
+	// Because your file uses inline tables like:
+	//   [libraries]
+	//   androidx-core-ktx = { group = "...", name = "...", version.ref = "coreKtx" }
+	// we treat libraries as a *toml.Tree, then each key is an inline table (map).
+	libTree, ok := librariesTree.(*toml.Tree)
 	if !ok {
 		return nil, fmt.Errorf("'libraries' is not a valid TOML table in '%s'", filePath)
 	}
 
-	// 3) For each key under [libraries], we expect:
-	//    [libraries.someKey]
-	//    module = "group:artifact"
-	//    version.ref = "someVersionKey"
-	for _, libKey := range libraries.Keys() {
-		item := libraries.Get(libKey)
-		lib, ok := item.(*toml.Tree)
-		if !ok {
+	deps := make(map[string]string)
+	for _, libKey := range libTree.Keys() {
+		val := libTree.Get(libKey)
+		// Inline table => should be map[string]interface{}
+		m, ok2 := val.(map[string]interface{})
+		if !ok2 {
+			// skip if not an inline table
 			continue
 		}
-		module, _ := lib.Get("module").(string)
-		if module == "" {
+
+		grp, _ := m["group"].(string)
+		nam, _ := m["name"].(string)
+
+		// version.ref => e.g. "coreKtx"
+		refVal := "unknown"
+		if ref, ok3 := m["version.ref"].(string); ok3 && ref != "" {
+			// see if it's in [versions]
+			if resolved, ok4 := versions[ref]; ok4 {
+				refVal = resolved
+			}
+		}
+
+		if grp == "" || nam == "" {
 			continue
 		}
-		versionRef, _ := lib.Get("version.ref").(string)
-		if versionRef == "" {
-			// EXACT logic => skip if no version.ref
-			continue
-		}
-		versionVal := "unknown"
-		if val, ok2 := versions[versionRef]; ok2 {
-			versionVal = val
-		}
-		parts := strings.Split(module, ":")
-		if len(parts) != 2 {
-			continue
-		}
-		key := parts[0] + "/" + parts[1]
-		deps[key] = versionVal
+
+		key := grp + "/" + nam
+		deps[key] = refVal
 	}
+
 	return deps, nil
 }
 
@@ -516,6 +523,7 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 		var queue []queueItem
 		visited := make(map[string]introducerSet)
 
+		// Enqueue direct dependencies
 		for ga, ver := range sec.DirectDeps {
 			key := ga + "@" + ver
 			ds := make(introducerSet)
@@ -538,6 +546,7 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 			allDeps[key] = ExtendedDep{Display: ver, Lookup: ver, Parent: "direct"}
 		}
 
+		// BFS loop
 		for len(queue) > 0 {
 			it := queue[0]
 			queue = queue[1:]
@@ -991,6 +1000,7 @@ func flattenBFS(sec *ReportSection) {
 	for _, root := range sec.DependencyTree {
 		walk(root)
 	}
+
 	sec.Flattened = append(copyleftRows, append(unknownRows, knownRows...)...)
 }
 
@@ -1029,15 +1039,12 @@ var finalHTML = `
     table { border-collapse: collapse; width: 95%; margin: 1em 0; }
     th, td { border: 1px solid #ccc; padding: 6px 8px; }
     th { background: #f7f7f7; }
-
     tr.copyleft { background-color: #ffcccc; }
     tr.unknown  { background-color: #ffffcc; }
     tr.known    { background-color: #ccffcc; }
-
     li.copyleft { background-color: #ffcccc; margin-bottom: 0.3em; padding: 4px; }
     li.unknown  { background-color: #ffffcc; margin-bottom: 0.3em; padding: 4px; }
     li.known    { background-color: #ccffcc; margin-bottom: 0.3em; padding: 4px; }
-
     .toggle-btn { cursor: pointer; font-weight: bold; color: #007bff; margin-right: 5px; }
     .toggle-btn:hover { text-decoration: underline; }
     .hidden { display: none; }
@@ -1139,11 +1146,11 @@ var finalHTML = `
 `
 
 // ----------------------------------------------------------------------
-// 16) MAIN
+// 14) MAIN FUNCTION
 // ----------------------------------------------------------------------
 
 func main() {
-	// Start Maven BFS workers
+	// Start Maven BFS workers.
 	for i := 0; i < pomWorkerCount; i++ {
 		wgWorkers.Add(1)
 		go pomFetchWorker()
@@ -1172,7 +1179,7 @@ func main() {
 		sections = append(sections, rs)
 	}
 
-	// 2) TOML => EXACT logic from single maven program
+	// 2) TOML => handle inline tables with group, name, version.ref
 	tomlFiles, err := findAllTOMLFiles(rootDir)
 	if err != nil {
 		log.Println("Error finding .toml files:", err)
@@ -1261,7 +1268,6 @@ func main() {
 		}
 	}
 
-	// Close BFS channel
 	close(pomRequests)
 	wgWorkers.Wait()
 
@@ -1275,6 +1281,7 @@ func main() {
 	}
 	fd := finalData{Sections: sections}
 
+	// Template function map => safeHTML + dict
 	funcMap := template.FuncMap{
 		"safeHTML": func(s string) template.HTML {
 			return template.HTML(s)
@@ -1301,7 +1308,7 @@ func main() {
 }
 
 // ----------------------------------------------------------------------
-// 16) COUNT TOTAL DEPENDENCIES
+// 15) COUNT TOTAL DEPENDENCIES
 // ----------------------------------------------------------------------
 
 func countTotalDependencies(nodes []*DependencyNode) int {
