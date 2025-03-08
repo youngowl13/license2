@@ -81,7 +81,8 @@ type ReportSection struct {
 	Flattened []FlattenedDep
 }
 
-// FlattenedDep holds data for each table row. The Details field will contain raw HTML.
+// FlattenedDep holds data for each table row.
+// The Details field will contain raw HTML (a clickable link).
 type FlattenedDep struct {
 	Dependency string
 	Version    string
@@ -250,15 +251,15 @@ func parseVersionRange(v string) string {
 }
 
 // ----------------------------------------------------------------------
-// LINK BUILDING FUNCTION FOR MAVEN
+// LINK BUILDING FUNCTION FOR MAVEN ARTIFACTS
 // ----------------------------------------------------------------------
-// This function returns a direct link for the "Project Details" column.
-// It chooses the repository based on the group ID.
+// buildMavenLink returns a direct link for the "Project Details" column.
+// If the group starts with "com.android.tools", it uses maven.google.com;
+// otherwise, it uses mvnrepository.com.
 func buildMavenLink(group, artifact, version string) string {
 	if strings.HasPrefix(group, "com.android.tools") {
 		return fmt.Sprintf("https://maven.google.com/web/index.html#%s:%s:%s", group, artifact, version)
 	}
-	// Default to mvnrepository.com
 	return fmt.Sprintf("https://mvnrepository.com/artifact/%s/%s/%s", group, artifact, version)
 }
 
@@ -939,7 +940,6 @@ func flattenBFS(sec *ReportSection) {
 	walk = func(node *DependencyNode) {
 		lowerPath := strings.ToLower(sec.FilePath)
 		var detail string
-		// For Maven/TOML/Gradle: use buildMavenLink to produce direct links.
 		if strings.HasSuffix(lowerPath, "pom.xml") ||
 			strings.HasSuffix(lowerPath, "build.gradle") ||
 			strings.HasSuffix(lowerPath, ".toml") {
@@ -978,7 +978,7 @@ func flattenBFS(sec *ReportSection) {
 }
 
 // ----------------------------------------------------------------------
-// 12) TEMPLATE HELPER: dict
+// TEMPLATE HELPER: dict (single definition)
 // ----------------------------------------------------------------------
 
 func dict(values ...interface{}) map[string]interface{} {
@@ -994,19 +994,6 @@ func dict(values ...interface{}) map[string]interface{} {
 		m[key] = values[i+1]
 	}
 	return m
-}
-
-// ----------------------------------------------------------------------
-// 13) LINK BUILDER FOR MAVEN ARTIFACTS
-// ----------------------------------------------------------------------
-// buildMavenLink chooses a direct link based on group ID.
-// If group starts with "com.android.tools", it uses maven.google.com,
-// otherwise it uses mvnrepository.com.
-func buildMavenLink(group, artifact, version string) string {
-	if strings.HasPrefix(group, "com.android.tools") {
-		return fmt.Sprintf("https://maven.google.com/web/index.html#%s:%s:%s", group, artifact, version)
-	}
-	return fmt.Sprintf("https://mvnrepository.com/artifact/%s/%s/%s", group, artifact, version)
 }
 
 // ----------------------------------------------------------------------
@@ -1289,7 +1276,7 @@ func main() {
 }
 
 // ----------------------------------------------------------------------
-// 15) COUNT TOTAL DEPENDENCIES
+// 16) COUNT TOTAL DEPENDENCIES
 // ----------------------------------------------------------------------
 
 func countTotalDependencies(nodes []*DependencyNode) int {
