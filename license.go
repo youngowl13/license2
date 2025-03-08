@@ -53,7 +53,7 @@ type DependencyNode struct {
 	Copyleft   bool
 	Parent     string            // "direct" or parent's coordinate
 	Transitive []*DependencyNode // BFS children
-	UsedPOMURL string            // For Maven => actual POM fetch URL; Node/Python => package page
+	UsedPOMURL string            // BFS link => actual POM fetch URL or package page
 	Direct     string            // top-level dependency that introduced this node
 }
 
@@ -247,6 +247,16 @@ func parseVersionRange(v string) string {
 		}
 	}
 	return v
+}
+
+// helper to build a link to Maven Central for group/artifact@version
+func buildMavenCentralLink(group, artifact, version string) string {
+	// For convenience, we use the search query approach
+	// E.g. https://search.maven.org/search?q=g:com.example%20AND%20a:artifact%20AND%20v:1.0
+	return fmt.Sprintf(
+		`<a href="https://search.maven.org/search?q=g:%s%%20AND%%20a:%s%%20AND%%20v:%s" target="_blank">Module: %s/%s v%s</a>`,
+		group, artifact, version, group, artifact, version,
+	)
 }
 
 // ----------------------------------------------------------------------
@@ -466,11 +476,9 @@ func concurrentFetchPOM(group, artifact, version string) (*MavenPOM, string, err
 	if cached, ok := pomCache.Load(key); ok {
 		return cached.(*MavenPOM), "", nil
 	}
-
 	channelMutex.Lock()
 	open := channelOpen
 	channelMutex.Unlock()
-
 	if !open {
 		pom, urlUsed, err := fetchRemotePOM(group, artifact, version)
 		if err == nil && pom != nil {
@@ -478,7 +486,6 @@ func concurrentFetchPOM(group, artifact, version string) (*MavenPOM, string, err
 		}
 		return pom, urlUsed, err
 	}
-
 	req := fetchRequest{
 		GroupID:    group,
 		ArtifactID: artifact,
@@ -486,7 +493,6 @@ func concurrentFetchPOM(group, artifact, version string) (*MavenPOM, string, err
 		ResultChan: make(chan fetchResult, 1),
 	}
 	pomRequests <- req
-
 	res := <-req.ResultChan
 	if res.Err == nil && res.POM != nil {
 		pomCache.Store(key, res.POM)
@@ -516,7 +522,6 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 			key := ga + "@" + ver
 			allDeps[key] = ExtendedDep{Display: ver, Lookup: ver, Parent: "direct"}
 		}
-
 		visited := make(map[string]introducerSet)
 		var queue []queueItem
 		var rootNodes []*DependencyNode
@@ -610,7 +615,6 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 			}
 		}
 
-		// Mark introducedBy
 		for _, root := range rootNodes {
 			setIntroducedBy(root, root.Name, allDeps)
 		}
@@ -673,7 +677,7 @@ func countCopyleftInTree(node *DependencyNode, sec *ReportSection) {
 	}
 }
 
-// colorRank: 0 => copyleft, 1 => unknown, 2 => known
+// colorRank => 0=red(copyleft), 1=yellow(unknown), 2=green(known)
 func colorRank(n *DependencyNode) int {
 	if n.Copyleft {
 		return 0
@@ -750,6 +754,7 @@ func resolveNodeDependency(pkgName, version string, visited map[string]bool) (*D
 	}
 	verData, ok := vs[version].(map[string]interface{})
 	if !ok {
+		// fallback
 		if dist, ok2 := data["dist-tags"].(map[string]interface{}); ok2 {
 			if lat, ok2 := dist["latest"].(string); ok2 {
 				if vMap, ok3 := vs[lat].(map[string]interface{}); ok3 {
@@ -940,22 +945,26 @@ func resolvePythonDependency(pkgName, version string, visited map[string]bool) (
 func flattenBFS(sec *ReportSection) {
 	var copyleftRows, unknownRows, knownRows []FlattenedDep
 
-	// We'll do a DFS to place each node into one of the three slices
 	var walk func(node *DependencyNode)
 	walk = func(node *DependencyNode) {
-		// Determine the text for "Project Details" column
 		lowerPath := strings.ToLower(sec.FilePath)
 		var detail string
+
 		if strings.HasSuffix(lowerPath, "pom.xml") ||
 			strings.HasSuffix(lowerPath, "build.gradle") ||
 			strings.HasSuffix(lowerPath, ".toml") {
-			// For Maven/TOML/Gradle => plain text from original parser style
-			detail = fmt.Sprintf("Module: %s v%s", node.Name, node.Version)
+			// Instead of plain text, build a link to Maven Central search
+			grp, art := splitGA(node.Name)
+			detail = fmt.Sprintf(
+				`<a href="https://search.maven.org/search?q=g:%s%%20AND%%20a:%s%%20AND%%20v:%s" target="_blank">Module: %s v%s</a>`,
+				grp, art, node.Version, node.Name, node.Version,
+			)
 		} else if strings.Contains(lowerPath, "package.json") ||
 			strings.Contains(lowerPath, "requirements.txt") {
-			// For Node/Python => link
-			detail = node.UsedPOMURL
+			// Node/Python => the package page link
+			detail = fmt.Sprintf(`<a href="%s" target="_blank">%s@%s</a>`, node.UsedPOMURL, node.Name, node.Version)
 		} else {
+			// fallback
 			detail = node.UsedPOMURL
 		}
 
@@ -982,12 +991,10 @@ func flattenBFS(sec *ReportSection) {
 		}
 	}
 
-	// Walk each BFS root
 	for _, root := range sec.DependencyTree {
 		walk(root)
 	}
 
-	// Combine: copyleft first, unknown second, known last
 	sec.Flattened = append(copyleftRows, append(unknownRows, knownRows...)...)
 }
 
@@ -1007,17 +1014,12 @@ var finalHTML = `
     table { border-collapse: collapse; width: 95%; margin: 1em 0; }
     th, td { border: 1px solid #ccc; padding: 6px 8px; }
     th { background: #f7f7f7; }
-
-    /* Table row colors */
-    tr.copyleft { background-color: #ffcccc; }  /* red */
-    tr.unknown  { background-color: #ffffcc; }  /* yellow */
-    tr.known    { background-color: #ccffcc; }  /* green */
-
-    /* BFS li colors */
+    tr.copyleft { background-color: #ffcccc; }
+    tr.unknown  { background-color: #ffffcc; }
+    tr.known    { background-color: #ccffcc; }
     li.copyleft { background-color: #ffcccc; margin-bottom: 0.3em; padding: 4px; }
     li.unknown  { background-color: #ffffcc; margin-bottom: 0.3em; padding: 4px; }
     li.known    { background-color: #ccffcc; margin-bottom: 0.3em; padding: 4px; }
-
     .toggle-btn { cursor: pointer; font-weight: bold; color: #007bff; margin-right: 5px; }
     .toggle-btn:hover { text-decoration: underline; }
     .hidden { display: none; }
@@ -1331,7 +1333,6 @@ func sortDependencyNodes(node *DependencyNode) {
 	}
 }
 
-// colorRank => 0=red(copyleft), 1=yellow(unknown), 2=green(known)
 func colorRank(n *DependencyNode) int {
 	if n.Copyleft {
 		return 0
