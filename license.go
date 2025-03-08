@@ -11,9 +11,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"  // needed for sorting BFS tree
 	"strings"
 	"sync"
-	"text/template/parse"
 	"time"
 
 	"github.com/pelletier/go-toml"
@@ -53,7 +53,7 @@ type DependencyNode struct {
 	Copyleft   bool
 	Parent     string            // "direct" or parent's coordinate
 	Transitive []*DependencyNode // BFS children
-	UsedPOMURL string            // For Maven => actual POM fetch URL; for Node/Python => package page
+	UsedPOMURL string            // For Maven => actual POM fetch URL; Node/Python => package page
 	Direct     string            // top-level dependency that introduced this node
 }
 
@@ -81,7 +81,6 @@ type ReportSection struct {
 	Flattened []FlattenedDep
 }
 
-// We'll store the "Project Details" HTML as a string, then render it safely in the template
 type FlattenedDep struct {
 	Dependency string
 	Version    string
@@ -89,7 +88,7 @@ type FlattenedDep struct {
 	TopLevel   string
 	License    string
 	Copyleft   bool
-	Details    string // will contain raw HTML link text
+	Details    string // "Project Details" column (HTML link)
 }
 
 type introducerSet map[string]bool
@@ -249,7 +248,7 @@ func parseVersionRange(v string) string {
 	return v
 }
 
-// Build a Maven Central link for the "Project Details" column
+// Build a Maven Central link for "Project Details"
 func buildMavenCentralLink(group, artifact, version string) string {
 	return fmt.Sprintf(
 		`<a href="https://search.maven.org/search?q=g:%s%%20AND%%20a:%s%%20AND%%20v:%s" target="_blank">Module: %s/%s v%s</a>`,
@@ -419,6 +418,7 @@ func fetchRemotePOM(group, artifact, version string) (*MavenPOM, string, error) 
 	groupPath := strings.ReplaceAll(group, ".", "/")
 	urlCentral := fmt.Sprintf("https://repo1.maven.org/maven2/%s/%s/%s/%s-%s.pom", groupPath, artifact, version, artifact, version)
 	urlGoogle := fmt.Sprintf("https://dl.google.com/dl/android/maven2/%s/%s/%s/%s-%s.pom", groupPath, artifact, version, artifact, version)
+
 	client := http.Client{Timeout: fetchTimeout}
 
 	resp, err := client.Get(urlCentral)
@@ -501,11 +501,13 @@ type queueItem struct {
 func buildTransitiveClosureJavaLike(sections []ReportSection) {
 	for i := range sections {
 		sec := &sections[i]
+
 		allDeps := make(map[string]ExtendedDep)
-		var queue []queueItem
 		var rootNodes []*DependencyNode
+		var queue []queueItem
 		visited := make(map[string]introducerSet)
 
+		// Enqueue direct dependencies
 		for ga, ver := range sec.DirectDeps {
 			key := ga + "@" + ver
 			ds := make(introducerSet)
@@ -528,6 +530,7 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 			allDeps[key] = ExtendedDep{Display: ver, Lookup: ver, Parent: "direct"}
 		}
 
+		// BFS
 		for len(queue) > 0 {
 			it := queue[0]
 			queue = queue[1:]
@@ -589,11 +592,12 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 			}
 		}
 
-		// Mark introducedBy
+		// introducedBy
 		for _, root := range rootNodes {
 			setIntroducedBy(root, root.Name, allDeps)
 		}
 		sec.DependencyTree = rootNodes
+
 		for k, v := range allDeps {
 			sec.AllDeps[k] = v
 		}
@@ -613,15 +617,16 @@ func buildTransitiveClosureJavaLike(sections []ReportSection) {
 		}
 		sec.IndirectCount = sec.TransitiveCount - sec.DirectCount
 
-		// BFS count copyleft
+		// Count copyleft
 		for _, root := range rootNodes {
 			countCopyleftInTree(root, sec)
 		}
 
-		// Sort BFS root nodes
+		// Sort BFS root nodes by color
 		sort.Slice(rootNodes, func(i, j int) bool {
 			return colorRank(rootNodes[i]) < colorRank(rootNodes[j])
 		})
+		// Recursively sort BFS children
 		for _, root := range rootNodes {
 			sortDependencyNodes(root)
 		}
@@ -916,21 +921,20 @@ func resolvePythonDependency(pkgName, version string, visited map[string]bool) (
 func flattenBFS(sec *ReportSection) {
 	var copyleftRows, unknownRows, knownRows []FlattenedDep
 
-	// We'll do a DFS and place each node into one of the three slices
 	var walk func(node *DependencyNode)
 	walk = func(node *DependencyNode) {
 		lowerPath := strings.ToLower(sec.FilePath)
 		var detail string
 
+		// For Maven/TOML/Gradle => clickable link to Maven Central
 		if strings.HasSuffix(lowerPath, "pom.xml") ||
 			strings.HasSuffix(lowerPath, "build.gradle") ||
 			strings.HasSuffix(lowerPath, ".toml") {
-			// For Maven/TOML/Gradle => clickable link to Maven Central
 			grp, art := splitGA(node.Name)
 			detail = buildMavenCentralLink(grp, art, node.Version)
 		} else if strings.Contains(lowerPath, "package.json") ||
 			strings.Contains(lowerPath, "requirements.txt") {
-			// For Node/Python => link to package page
+			// Node/Python => link to package page
 			detail = fmt.Sprintf(`<a href="%s" target="_blank">%s@%s</a>`, node.UsedPOMURL, node.Name, node.Version)
 		} else {
 			// fallback
@@ -954,7 +958,6 @@ func flattenBFS(sec *ReportSection) {
 		} else {
 			knownRows = append(knownRows, row)
 		}
-
 		for _, child := range node.Transitive {
 			walk(child)
 		}
@@ -970,9 +973,6 @@ func flattenBFS(sec *ReportSection) {
 // ----------------------------------------------------------------------
 // 12) FINAL HTML TEMPLATE
 // ----------------------------------------------------------------------
-//
-// We define a custom pipeline "safeHTML" so that the "Project Details" are not escaped as text.
-// This ensures the user sees a clickable link in the table.
 
 var finalHTML = `
 <!DOCTYPE html>
@@ -1082,7 +1082,6 @@ var finalHTML = `
     <br/>
     License: {{$child.License}}<br/>
     POM File Link: {{if $child.UsedPOMURL}}<a href="{{$child.UsedPOMURL}}" target="_blank">Open</a>{{else}}(none){{end}}
-
     {{if $child.Transitive}}
     <ul class="hidden" id="sub-{{$data.File}}-{{$data.Prefix}}-{{$j}}">
       {{template "subTree" (dict "Nodes" $child.Transitive "File" $data.File "Prefix" (print $data.Prefix "-" $j))}}
@@ -1096,7 +1095,7 @@ var finalHTML = `
 `
 
 // ----------------------------------------------------------------------
-// 13) MAIN
+// 13) MAIN FUNCTION
 // ----------------------------------------------------------------------
 
 func main() {
@@ -1218,11 +1217,10 @@ func main() {
 		}
 	}
 
-	// Close BFS channel
 	close(pomRequests)
 	wgWorkers.Wait()
 
-	// Flatten BFS => table
+	// Flatten BFS trees => table
 	for i := range sections {
 		flattenBFS(&sections[i])
 	}
@@ -1232,7 +1230,7 @@ func main() {
 	}
 	fd := finalData{Sections: sections}
 
-	// We'll define a template function "safeHTML" to render .Details as HTML
+	// We'll define a template function "safeHTML" so that .Details is not escaped
 	funcMap := template.FuncMap{
 		"safeHTML": func(s string) template.HTML {
 			return template.HTML(s)
@@ -1272,4 +1270,22 @@ func countTotalDependencies(nodes []*DependencyNode) int {
 	}
 	rec(nodes)
 	return count
+}
+
+// ----------------------------------------------------------------------
+// 16) SORTING BFS TREE NODES BY COLOR
+// ----------------------------------------------------------------------
+
+func sortDependencyNodes(node *DependencyNode) {
+	sort.Slice(node.Transitive, func(i, j int) bool {
+		ri := colorRank(node.Transitive[i])
+		rj := colorRank(node.Transitive[j])
+		if ri != rj {
+			return ri < rj
+		}
+		return node.Transitive[i].Name < node.Transitive[j].Name
+	})
+	for _, child := range node.Transitive {
+		sortDependencyNodes(child)
+	}
 }
