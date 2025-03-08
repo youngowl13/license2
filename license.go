@@ -81,8 +81,7 @@ type ReportSection struct {
 	Flattened []FlattenedDep
 }
 
-// FlattenedDep holds data for each table row.
-// The Details field will contain raw HTML (a clickable link).
+// FlattenedDep holds data for each table row. The Details field will contain raw HTML.
 type FlattenedDep struct {
 	Dependency string
 	Version    string
@@ -250,12 +249,17 @@ func parseVersionRange(v string) string {
 	return v
 }
 
-// Build a Maven Central search link for the "Project Details" column
-func buildMavenCentralLink(group, artifact, version string) string {
-	return fmt.Sprintf(
-		`<a href="https://search.maven.org/search?q=g:%s%%20AND%%20a:%s%%20AND%%20v:%s" target="_blank">Module: %s/%s v%s</a>`,
-		group, artifact, version, group, artifact, version,
-	)
+// ----------------------------------------------------------------------
+// LINK BUILDING FUNCTION FOR MAVEN
+// ----------------------------------------------------------------------
+// This function returns a direct link for the "Project Details" column.
+// It chooses the repository based on the group ID.
+func buildMavenLink(group, artifact, version string) string {
+	if strings.HasPrefix(group, "com.android.tools") {
+		return fmt.Sprintf("https://maven.google.com/web/index.html#%s:%s:%s", group, artifact, version)
+	}
+	// Default to mvnrepository.com
+	return fmt.Sprintf("https://mvnrepository.com/artifact/%s/%s/%s", group, artifact, version)
 }
 
 // ----------------------------------------------------------------------
@@ -663,7 +667,7 @@ func colorRank(n *DependencyNode) int {
 	return 2
 }
 
-// sortDependencyNodes recursively sorts a node's children by color and then name.
+// sortDependencyNodes recursively sorts a node's children by color then by name.
 func sortDependencyNodes(node *DependencyNode) {
 	sort.Slice(node.Transitive, func(i, j int) bool {
 		ri := colorRank(node.Transitive[i])
@@ -935,11 +939,12 @@ func flattenBFS(sec *ReportSection) {
 	walk = func(node *DependencyNode) {
 		lowerPath := strings.ToLower(sec.FilePath)
 		var detail string
+		// For Maven/TOML/Gradle: use buildMavenLink to produce direct links.
 		if strings.HasSuffix(lowerPath, "pom.xml") ||
 			strings.HasSuffix(lowerPath, "build.gradle") ||
 			strings.HasSuffix(lowerPath, ".toml") {
 			grp, art := splitGA(node.Name)
-			detail = buildMavenCentralLink(grp, art, node.Version)
+			detail = buildMavenLink(grp, art, node.Version)
 		} else if strings.Contains(lowerPath, "package.json") ||
 			strings.Contains(lowerPath, "requirements.txt") {
 			detail = fmt.Sprintf(`<a href="%s" target="_blank">%s@%s</a>`, node.UsedPOMURL, node.Name, node.Version)
@@ -992,9 +997,22 @@ func dict(values ...interface{}) map[string]interface{} {
 }
 
 // ----------------------------------------------------------------------
-// 13) FINAL HTML TEMPLATE
+// 13) LINK BUILDER FOR MAVEN ARTIFACTS
 // ----------------------------------------------------------------------
-// The template uses a custom pipeline "safeHTML" to render the Details field as HTML.
+// buildMavenLink chooses a direct link based on group ID.
+// If group starts with "com.android.tools", it uses maven.google.com,
+// otherwise it uses mvnrepository.com.
+func buildMavenLink(group, artifact, version string) string {
+	if strings.HasPrefix(group, "com.android.tools") {
+		return fmt.Sprintf("https://maven.google.com/web/index.html#%s:%s:%s", group, artifact, version)
+	}
+	return fmt.Sprintf("https://mvnrepository.com/artifact/%s/%s/%s", group, artifact, version)
+}
+
+// ----------------------------------------------------------------------
+// 14) FINAL HTML TEMPLATE
+// ----------------------------------------------------------------------
+// The template uses a custom pipeline "safeHTML" so that the Details field renders as HTML.
 
 var finalHTML = `
 <!DOCTYPE html>
@@ -1109,7 +1127,7 @@ var finalHTML = `
 `
 
 // ----------------------------------------------------------------------
-// 14) MAIN FUNCTION
+// 15) MAIN FUNCTION
 // ----------------------------------------------------------------------
 
 func main() {
@@ -1123,7 +1141,7 @@ func main() {
 
 	var sections []ReportSection
 
-	// 1) Maven Files
+	// Maven Files
 	pomFiles, err := findAllPOMFiles(rootDir)
 	if err != nil {
 		log.Println("Error finding pom.xml files:", err)
@@ -1142,7 +1160,7 @@ func main() {
 		sections = append(sections, rs)
 	}
 
-	// 2) TOML Files
+	// TOML Files
 	tomlFiles, err := findAllTOMLFiles(rootDir)
 	if err != nil {
 		log.Println("Error finding .toml files:", err)
@@ -1161,7 +1179,7 @@ func main() {
 		sections = append(sections, rs)
 	}
 
-	// 3) Gradle Files
+	// Gradle Files
 	gradleFiles, err := findAllGradleFiles(rootDir)
 	if err != nil {
 		log.Println("Error finding Gradle files:", err)
@@ -1183,7 +1201,7 @@ func main() {
 	// BFS expansions for Maven/TOML/Gradle
 	buildTransitiveClosureJavaLike(sections)
 
-	// 4) Node Dependencies
+	// Node Dependencies
 	nodeFile := findFile(rootDir, "package.json")
 	if nodeFile != "" {
 		nodeDeps, err := parseNodeDependencies(nodeFile)
@@ -1207,7 +1225,7 @@ func main() {
 		}
 	}
 
-	// 5) Python Dependencies
+	// Python Dependencies
 	pyFile := findFile(rootDir, "requirements.txt")
 	if pyFile != "" {
 		pyDeps, err := parsePythonDependencies(pyFile)
@@ -1234,7 +1252,7 @@ func main() {
 	close(pomRequests)
 	wgWorkers.Wait()
 
-	// Flatten each BFS tree into table rows.
+	// Flatten BFS trees into table rows.
 	for i := range sections {
 		flattenBFS(&sections[i])
 	}
@@ -1271,7 +1289,7 @@ func main() {
 }
 
 // ----------------------------------------------------------------------
-// 14) COUNT TOTAL DEPENDENCIES
+// 15) COUNT TOTAL DEPENDENCIES
 // ----------------------------------------------------------------------
 
 func countTotalDependencies(nodes []*DependencyNode) int {
