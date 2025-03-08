@@ -53,7 +53,7 @@ type DependencyNode struct {
 	Copyleft   bool
 	Parent     string            // "direct" or parent's coordinate
 	Transitive []*DependencyNode // BFS children
-	UsedPOMURL string            // For Maven => actual POM fetch URL; for Node/Python => package page
+	UsedPOMURL string            // For Maven => actual POM fetch URL; for Node/Python => package page link
 	Direct     string            // top-level dependency that introduced this node
 }
 
@@ -237,7 +237,7 @@ func isCopyleftChecker(license string) bool {
 	return false
 }
 
-// parseVersionRange attempts to handle things like [1.0.0, 2.0.0)
+// parseVersionRange attempts to handle [1.0.0,2.0.0)
 func parseVersionRange(v string) string {
 	v = strings.TrimSpace(v)
 	if (strings.HasPrefix(v, "[") || strings.HasPrefix(v, "(")) && strings.Contains(v, ",") {
@@ -251,12 +251,12 @@ func parseVersionRange(v string) string {
 }
 
 // buildMavenLink => direct artifact link
-// If group starts with "com.android.tools", link to maven.google.com
-// else link to mvnrepository.com
 func buildMavenLink(group, artifact, version string) string {
 	if strings.HasPrefix(group, "com.android.tools") {
+		// Google
 		return fmt.Sprintf("https://maven.google.com/web/index.html#%s:%s:%s", group, artifact, version)
 	}
+	// Default => mvnrepository
 	return fmt.Sprintf("https://mvnrepository.com/artifact/%s/%s/%s", group, artifact, version)
 }
 
@@ -288,10 +288,13 @@ func parseOneLocalPOMFile(filePath string) (map[string]string, error) {
 	return deps, nil
 }
 
+// --------------
+// FIXED parseTOMLFile with fallback
+// --------------
 func parseTOMLFile(filePath string) (map[string]string, error) {
 	tree, err := toml.LoadFile(filePath)
 	if err != nil {
-		return nil, fmt.Errorf("error loading TOML file: %v", err)
+		return nil, fmt.Errorf("error loading TOML file '%s': %v", filePath, err)
 	}
 	versions, err := loadVersions(tree)
 	if err != nil {
@@ -299,11 +302,11 @@ func parseTOMLFile(filePath string) (map[string]string, error) {
 	}
 	librariesTree := tree.Get("libraries")
 	if librariesTree == nil {
-		return nil, fmt.Errorf("TOML file missing 'libraries' table")
+		return nil, fmt.Errorf("TOML file '%s' missing 'libraries' table", filePath)
 	}
 	libraries, ok := librariesTree.(*toml.Tree)
 	if !ok {
-		return nil, fmt.Errorf("'libraries' is not a valid TOML table")
+		return nil, fmt.Errorf("'libraries' is not a valid TOML table in '%s'", filePath)
 	}
 	deps := make(map[string]string)
 	for _, libKey := range libraries.Keys() {
@@ -312,17 +315,26 @@ func parseTOMLFile(filePath string) (map[string]string, error) {
 		if !ok {
 			continue
 		}
-		module, ok := lib.Get("module").(string)
-		if !ok {
+		module, _ := lib.Get("module").(string)
+		if module == "" {
 			continue
 		}
-		versionRef, ok := lib.Get("version.ref").(string)
-		if !ok {
-			continue
+		// Check "version.ref" or fallback to "version"
+		versionRef, _ := lib.Get("version.ref").(string)
+		if versionRef == "" {
+			if directV, _ := lib.Get("version").(string); directV != "" {
+				versionRef = directV
+			}
 		}
-		versionVal, ok := versions[versionRef]
-		if !ok {
-			versionVal = "unknown"
+		versionVal := "unknown"
+		if versionRef != "" {
+			// If "versionRef" is in the "versions" map, use that
+			if val, ok2 := versions[versionRef]; ok2 {
+				versionVal = val
+			} else {
+				// Otherwise, treat "versionRef" as the direct version
+				versionVal = versionRef
+			}
 		}
 		parts := strings.Split(module, ":")
 		if len(parts) != 2 {
@@ -933,7 +945,7 @@ func flattenBFS(sec *ReportSection) {
 
 	var walk func(node *DependencyNode)
 	walk = func(node *DependencyNode) {
-		// 1) If the version contains a placeholder like "${...}", treat as "unknown".
+		// 1) If the version has a placeholder ${...}, treat as "unknown".
 		// 2) Remove bracket/parenthesis chars: [ ] ( )
 		versionToUse := node.Version
 		if strings.Contains(versionToUse, "${") {
@@ -951,7 +963,7 @@ func flattenBFS(sec *ReportSection) {
 			strings.HasSuffix(lowerPath, "build.gradle") ||
 			strings.HasSuffix(lowerPath, ".toml") {
 
-			// For Maven/TOML/Gradle => produce direct artifact link
+			// For Maven/TOML/Gradle => direct artifact link
 			grp, art := splitGA(node.Name)
 			artifactURL := buildMavenLink(grp, art, versionToUse)
 			detail = fmt.Sprintf(
@@ -983,7 +995,6 @@ func flattenBFS(sec *ReportSection) {
 			Details:    detail,
 		}
 
-		// Sort into copyleft / unknown / known
 		if node.Copyleft {
 			copyleftRows = append(copyleftRows, row)
 		} else if strings.EqualFold(node.License, "unknown") {
@@ -1286,7 +1297,6 @@ func main() {
 	}
 	fd := finalData{Sections: sections}
 
-	// Template function map => safeHTML + dict
 	funcMap := template.FuncMap{
 		"safeHTML": func(s string) template.HTML {
 			return template.HTML(s)
